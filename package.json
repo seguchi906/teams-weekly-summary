@@ -1,0 +1,16 @@
+{
+  "name": "teams-weekly-summary",
+  "version": "1.0.0",
+  "description": "週次 Teams レポート自動生成・送信スクリプト",
+  "type": "module",
+  "scripts": {
+    "report": "node scripts/generate-report.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@neondatabase/serverless": "^1.0.2",
+    "puppeteer": "^24.40.0"
+  }
+}

@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI 週次レポート</title>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Noto Sans JP', 'sans-serif'],
+          },
+        },
+      },
+    }
+  </script>
+</head>
+<body class="min-h-screen bg-gradient-to-br from-slate-100 to-blue-50 py-8 px-4 font-sans">
+
+  <div class="w-full max-w-2xl mx-auto">
+
+    <!-- カードコンテナ -->
+    <div class="bg-white rounded-2xl shadow-xl overflow-hidden">
+
+      <!-- ヘッダー -->
+      <div class="bg-gradient-to-r from-slate-700 to-slate-900 px-6 py-5 text-white">
+        <span class="inline-block text-xs font-medium bg-white/20 rounded-full px-2.5 py-0.5 mb-2 tracking-wide">
+          AI レポート
+        </span>
+        <div class="flex items-baseline justify-between">
+          <h1 class="text-xl sm:text-2xl font-bold tracking-tight">週次レポート</h1>
+          <p class="text-slate-300 text-sm">{{DATE}}</p>
+        </div>
+      </div>
+
+      <!-- サマリーバー -->
+      <div class="flex flex-wrap items-center gap-4 sm:gap-6 px-5 py-3 bg-slate-50 border-b border-slate-100 text-sm">
+        <div class="flex items-center gap-1.5 text-slate-600">
+          <span class="font-medium">合計生産額</span>
+          <span class="font-bold text-slate-800">{{TOTAL_AMOUNT}} 万円</span>
+        </div>
+        <div class="flex items-center gap-1.5">
+          <span class="w-2 h-2 rounded-full bg-red-500 flex-shrink-0" aria-hidden="true"></span>
+          <span class="font-semibold text-red-600">高リスク該当：{{HIGH_RISK_DEPT}}</span>
+        </div>
+      </div>
+
+      <!-- テーブル -->
+      <div class="overflow-x-auto">
+        <table
+          class="w-full text-center"
+          aria-label="AI週次レポート：部署別生産額・高リスク業務状況"
+        >
+          <caption class="sr-only">部署別の生産額と高リスク業務件数の週次サマリー</caption>
+
+          <thead>
+            <tr class="border-b border-slate-100 bg-slate-50/70">
+              <th scope="col" class="px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider w-1/4">
+                課
+              </th>
+              <th scope="col" class="px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider w-1/3">
+                生産額
+              </th>
+              <th scope="col" class="px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                高リスク業務
+              </th>
+            </tr>
+          </thead>
+
+          <tbody class="divide-y divide-slate-100">
+            {{DEPT_ROWS}}
+          </tbody>
+        </table>
+      </div>
+
+      <!-- 凡例・補足 -->
+      <div class="px-5 py-4 bg-slate-50 border-t border-slate-100 text-xs text-slate-400 space-y-1">
+        <p>※ 高リスク業務とは、納期まで14日以内かつ進行中の業務です。</p>
+        <p>※ 生産額は各課の配分額合計（税抜・万円単位）です。</p>
+      </div>
+
+    </div>
+  </div>
+
+</body>
+</html>
