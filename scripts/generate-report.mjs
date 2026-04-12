@@ -4,29 +4,30 @@
  * 週次 Teams レポートを自動生成・送信するメインスクリプト。
  *
  * 処理の流れ:
- *   1. OVERALL_PROJECT_SCHEDULE DB からプロジェクト（受注金額・担当課）を取得
- *   2. PROGRESS_BASHBOARD DB から進捗率を取得
- *   3. projectId / projectName でジョインし、生産金額 = 受注金額 × 進捗率 を課ごとに集計
+ *   1. overall-project-schedule の REST API からプロジェクト（受注金額・担当課）を取得
+ *   2. PROGRESS_BASHBOARD Neon DB から進捗率を取得
+ *   3. overall.number === progress.id（業務番号）でジョインし、
+ *      生産金額 = allocationSectionN × currentProgress / 100 を課ごとに集計
  *   4. index.html テンプレートにデータを埋め込んで dist/report.html を生成
  *   5. Playwright でスクリーンショット → dist/report-latest.png
  *   6. Teams Incoming Webhook に Adaptive Card を送信
  *
  * 必要な環境変数:
- *   DATABASE_URL            - OVERALL_PROJECT_SCHEDULE（受注金額）の Neon 接続文字列
- *   PROGRESS_BASHBOARD_URL  - PROGRESS_BASHBOARD（進捗率）の Neon 接続文字列
- *   TEAMS_WEBHOOK_URL       - Teams チャネルの Incoming Webhook URL
- *   PAGES_BASE_URL          - GitHub Pages のベース URL（例: https://user.github.io/repo）
+ *   OVERALL_PROJECT_SCHEDULE_URL - overall-project-schedule アプリの URL
+ *                                  （例: https://your-app.example.com）
+ *                                  /api/projects-data エンドポイントを使用する
+ *   PROGRESS_BASHBOARD_URL       - PROGRESS_BASHBOARD の Neon 接続文字列
+ *   TEAMS_WEBHOOK_URL            - Teams チャネルの Incoming Webhook URL
+ *   PAGES_BASE_URL               - GitHub Pages のベース URL（例: https://user.github.io/repo）
  *
- * 両 DB のスキーマ想定:
+ * overall-project-schedule API レスポンス（GET /api/projects-data）:
+ *   { projects: [ { id, number, name, status, contractAmount,
+ *                   allocationSection1, allocationSection2, allocationSection3,
+ *                   responsibleSections, revisedEndDate, endDate, ... } ] }
+ *
+ * PROGRESS_BASHBOARD の app_data スキーマ:
  *   app_data テーブル, key = 'projects', value は JSONB 配列。
- *
- *   OVERALL_PROJECT_SCHEDULE の各要素:
- *     { id, projectName, status, responsibleSections: [...],
- *       allocationSection1, allocationSection2, allocationSection3,
- *       revisedEndDate, endDate }
- *
- *   PROGRESS_BASHBOARD の各要素:
- *     { id, projectName, progress }   ← progress は 0〜100 の数値
+ *   各要素: { id: "46-003", name: "...", weeklyProgress: [null, 30, 60, ...] }
  */
 
 import { neon } from "@neondatabase/serverless";
@@ -53,20 +54,28 @@ const SECTIONS = ["1課", "2課", "3課"];
 // ──────────────────────────────────────────────
 
 /**
- * OVERALL_PROJECT_SCHEDULE DB から全プロジェクトを取得する。
- * ステータスフィルタはかけず、JS 側で振り分ける。
+ * overall-project-schedule の REST API からプロジェクト一覧を取得する。
+ * エンドポイント: GET {baseUrl}/api/projects-data
+ * レスポンス: { projects: Project[], title, updatedAt, fiscalPeriods }
  *
- * @param {import("@neondatabase/serverless").NeonQueryFunction} sql
+ * @param {string} baseUrl  overall-project-schedule アプリのベース URL
  * @returns {Promise<Object[]>} プロジェクトオブジェクトの配列
  */
-async function fetchAllProjects(sql) {
-  const rows = await sql`
-    SELECT p AS project
-    FROM   app_data,
-           jsonb_array_elements(value) AS p
-    WHERE  key = 'projects'
-  `;
-  return rows.map((r) => r.project);
+async function fetchAllProjects(baseUrl) {
+  const url = `${baseUrl.replace(/\/$/, "")}/api/projects-data`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(
+      `overall-project-schedule API 呼び出し失敗: HTTP ${res.status} ${res.statusText}\nURL: ${url}`
+    );
+  }
+  const data = await res.json();
+  if (!Array.isArray(data.projects)) {
+    throw new Error(
+      `overall-project-schedule API のレスポンスに projects 配列がありません。\n受信データ: ${JSON.stringify(data).slice(0, 200)}`
+    );
+  }
+  return data.projects;
 }
 
 /**
@@ -443,14 +452,17 @@ async function sendTeamsNotification(opts) {
 
 async function main() {
   // ── 環境変数チェック ──
-  const DATABASE_URL           = process.env.DATABASE_URL;
-  const PROGRESS_BASHBOARD_URL = process.env.PROGRESS_BASHBOARD_URL;
-  const TEAMS_WEBHOOK_URL      = process.env.TEAMS_WEBHOOK_URL;
-  const PAGES_BASE_URL         = process.env.PAGES_BASE_URL ?? "";
+  const OVERALL_PROJECT_SCHEDULE_URL = process.env.OVERALL_PROJECT_SCHEDULE_URL;
+  const PROGRESS_BASHBOARD_URL       = process.env.PROGRESS_BASHBOARD_URL;
+  const TEAMS_WEBHOOK_URL            = process.env.TEAMS_WEBHOOK_URL;
+  const PAGES_BASE_URL               = process.env.PAGES_BASE_URL ?? "";
 
-  if (!DATABASE_URL)           throw new Error("環境変数 DATABASE_URL が未設定です。");
-  if (!PROGRESS_BASHBOARD_URL) throw new Error("環境変数 PROGRESS_BASHBOARD_URL が未設定です。");
-  if (!TEAMS_WEBHOOK_URL)      throw new Error("環境変数 TEAMS_WEBHOOK_URL が未設定です。");
+  if (!OVERALL_PROJECT_SCHEDULE_URL)
+    throw new Error("環境変数 OVERALL_PROJECT_SCHEDULE_URL が未設定です。");
+  if (!PROGRESS_BASHBOARD_URL)
+    throw new Error("環境変数 PROGRESS_BASHBOARD_URL が未設定です。");
+  if (!TEAMS_WEBHOOK_URL)
+    throw new Error("環境変数 TEAMS_WEBHOOK_URL が未設定です。");
   if (!PAGES_BASE_URL)
     console.warn("警告: PAGES_BASE_URL が未設定です。Teams の画像 URL が不正になります。");
 
@@ -464,14 +476,14 @@ async function main() {
 
   console.log(`レポート生成開始: ${dateLabel}`);
 
-  // ── 2つの Neon DB に接続 ──
-  const sqlOverall   = neon(DATABASE_URL);
-  const sqlProgress  = neon(PROGRESS_BASHBOARD_URL);
+  // ── PROGRESS_BASHBOARD の Neon DB に接続 ──
+  const sqlProgress = neon(PROGRESS_BASHBOARD_URL);
 
-  // ── 両 DB から並列取得 ──
-  console.log("両 DB からデータを取得しています...");
+  // ── 両ソースから並列取得 ──
+  console.log("データを取得しています...");
+  console.log(`  overall-project-schedule API: ${OVERALL_PROJECT_SCHEDULE_URL}`);
   const [allProjects, progressMap] = await Promise.all([
-    fetchAllProjects(sqlOverall),
+    fetchAllProjects(OVERALL_PROJECT_SCHEDULE_URL),
     fetchProgressRates(sqlProgress),
   ]);
 
