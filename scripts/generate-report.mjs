@@ -41,57 +41,54 @@ const SECTIONS = ["1課", "2課", "3課"];
 /**
  * 各課の集計データを取得する。
  *
- * 前提となる Neon テーブル定義（実際のスキーマに合わせて調整してください）:
+ * progress-dashboard が使用する Neon DB のスキーマ:
  *
- *   CREATE TABLE projects (
- *     id                  TEXT PRIMARY KEY,
- *     field               TEXT,
- *     number              TEXT,
- *     name                TEXT,
- *     office              TEXT,
- *     department          TEXT,
- *     manager             TEXT,
- *     start_date          DATE,
- *     end_date            DATE,
- *     revised_end_date    DATE,
- *     contract_amount     BIGINT,
- *     status              TEXT,         -- '完納' | '仮納品' | '進行中' | '未着手'
- *     allocation_section1 BIGINT,       -- 1課の配分額（税抜・円）
- *     allocation_section2 BIGINT,       -- 2課の配分額（税抜・円）
- *     allocation_section3 BIGINT,       -- 3課の配分額（税抜・円）
- *     responsible_sections TEXT[]       -- ['1課', '2課', '3課'] の部分集合
+ *   CREATE TABLE app_data (
+ *     key        VARCHAR(50) PRIMARY KEY,
+ *     value      JSONB NOT NULL,
+ *     updated_at TIMESTAMPTZ DEFAULT NOW()
  *   );
+ *
+ *   key='projects' の value にプロジェクト配列が JSONB で保存されている。
+ *   各プロジェクトのキーは camelCase（例: allocationSection1, responsibleSections）。
  *
  * @param {import("@neondatabase/serverless").NeonQueryFunction} sql
  * @returns {Promise<SectionStat[]>}
  */
 async function fetchSectionStats(sql) {
   /**
-   * 各課の集計を1クエリで取得。
-   * responsible_sections を UNNEST で展開し、課ごとに集計する。
-   * 「実質の終了日」は revised_end_date があればそちらを優先する。
+   * app_data の JSONB 配列を jsonb_array_elements で展開し、
+   * さらに responsibleSections 配列を jsonb_array_elements_text で展開して課ごとに集計する。
+   * 「実質の終了日」は revisedEndDate があればそちらを優先する。
+   * responsibleSections が未設定のプロジェクトは COALESCE で空配列扱いとしてスキップ。
    */
   const rows = await sql`
     SELECT
       sec                                       AS section,
       SUM(
         CASE sec
-          WHEN '1課' THEN COALESCE(p.allocation_section1, 0)
-          WHEN '2課' THEN COALESCE(p.allocation_section2, 0)
-          WHEN '3課' THEN COALESCE(p.allocation_section3, 0)
+          WHEN '1課' THEN COALESCE((p->>'allocationSection1')::BIGINT, 0)
+          WHEN '2課' THEN COALESCE((p->>'allocationSection2')::BIGINT, 0)
+          WHEN '3課' THEN COALESCE((p->>'allocationSection3')::BIGINT, 0)
           ELSE 0
         END
       )                                         AS total_allocation,
       COUNT(*)                                  AS total_count,
       SUM(
-        CASE WHEN p.status = '進行中'
-              AND COALESCE(p.revised_end_date, p.end_date)
-                  <= CURRENT_DATE + ${HIGH_RISK_DAYS}
+        CASE WHEN p->>'status' = '進行中'
+              AND COALESCE(
+                    (p->>'revisedEndDate')::DATE,
+                    (p->>'endDate')::DATE
+                  ) <= CURRENT_DATE + ${HIGH_RISK_DAYS}
              THEN 1 ELSE 0 END
       )                                         AS high_risk_count
-    FROM projects p,
-         UNNEST(p.responsible_sections) AS t(sec)
-    WHERE p.status NOT IN ('完納', '仮納品')
+    FROM app_data,
+         jsonb_array_elements(value) AS p,
+         jsonb_array_elements_text(
+           COALESCE(p->'responsibleSections', '[]'::jsonb)
+         ) AS sec
+    WHERE key = 'projects'
+      AND p->>'status' NOT IN ('完納', '仮納品')
     GROUP BY sec
     ORDER BY sec
   `;
@@ -112,17 +109,23 @@ async function fetchLastWeekAllocation(sql) {
       sec,
       SUM(
         CASE sec
-          WHEN '1課' THEN COALESCE(p.allocation_section1, 0)
-          WHEN '2課' THEN COALESCE(p.allocation_section2, 0)
-          WHEN '3課' THEN COALESCE(p.allocation_section3, 0)
+          WHEN '1課' THEN COALESCE((p->>'allocationSection1')::BIGINT, 0)
+          WHEN '2課' THEN COALESCE((p->>'allocationSection2')::BIGINT, 0)
+          WHEN '3課' THEN COALESCE((p->>'allocationSection3')::BIGINT, 0)
           ELSE 0
         END
       ) AS last_week_allocation
-    FROM projects p,
-         UNNEST(p.responsible_sections) AS t(sec)
-    WHERE p.status IN ('完納', '仮納品')
-      AND COALESCE(p.revised_end_date, p.end_date)
-          BETWEEN CURRENT_DATE - 14 AND CURRENT_DATE - 7
+    FROM app_data,
+         jsonb_array_elements(value) AS p,
+         jsonb_array_elements_text(
+           COALESCE(p->'responsibleSections', '[]'::jsonb)
+         ) AS sec
+    WHERE key = 'projects'
+      AND p->>'status' IN ('完納', '仮納品')
+      AND COALESCE(
+            (p->>'revisedEndDate')::DATE,
+            (p->>'endDate')::DATE
+          ) BETWEEN CURRENT_DATE - 14 AND CURRENT_DATE - 7
     GROUP BY sec
   `;
 
