@@ -7,21 +7,27 @@ on:
   # GitHub 画面から手動実行も可能
   workflow_dispatch:
 
+# actions/deploy-pages に必要な権限
 permissions:
-  contents: write  # gh-pages ブランチへのプッシュに必要
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
   report:
     runs-on: ubuntu-latest
 
+    # GitHub Pages デプロイ先 URL を environment として紐づける
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
       # ─────────────────────────────────────────
-      # 1. リポジトリのチェックアウト（全履歴取得）
+      # 1. リポジトリのチェックアウト
       # ─────────────────────────────────────────
       - name: リポジトリをチェックアウト
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       # ─────────────────────────────────────────
       # 2. Node.js のセットアップ
@@ -48,7 +54,8 @@ jobs:
       # ─────────────────────────────────────────
       # 5. レポート生成・Teams 通知送信
       #    generate-report.mjs が以下を行う:
-      #      - Neon DB からデータ取得・集計
+      #      - overall-project-schedule API からデータ取得・集計
+      #      - Neon DB から進捗率を取得しジョイン
       #      - HTML テンプレートにデータを埋め込む
       #      - Playwright でスクリーンショット撮影
       #      - Teams Incoming Webhook に Adaptive Card 送信
@@ -59,22 +66,26 @@ jobs:
           OVERALL_PROJECT_SCHEDULE_URL: ${{ secrets.OVERALL_PROJECT_SCHEDULE }}
           PROGRESS_BASHBOARD_URL: ${{ secrets.PROGRESS_BASHBOARD }}
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
-          PAGES_BASE_URL: ${{ vars.PAGES_BASE_URL }}
+          PAGES_BASE_URL: https://seguchi906.github.io/teams-weekly-summary
 
       # ─────────────────────────────────────────
-      # 6. スクリーンショットを GitHub Pages に公開
-      #    peaceiris/actions-gh-pages で gh-pages ブランチを自動管理
+      # 6. dist フォルダを GitHub Pages アーティファクトとしてアップロード
+      #    → https://seguchi906.github.io/teams-weekly-summary/report-latest.png
       # ─────────────────────────────────────────
-      - name: GitHub Pages にスクリーンショットを公開
-        uses: peaceiris/actions-gh-pages@v4
+      - name: GitHub Pages アーティファクトをアップロード
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./dist
-          keep_files: false
-          commit_message: "chore: 週次レポート更新"
+          path: ./dist
 
       # ─────────────────────────────────────────
-      # 7. 生成ファイルをアーティファクトとして保存（デバッグ用）
+      # 7. GitHub Pages にデプロイ
+      # ─────────────────────────────────────────
+      - name: GitHub Pages にデプロイ
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      # ─────────────────────────────────────────
+      # 8. 生成ファイルをアーティファクトとして保存（デバッグ用）
       # ─────────────────────────────────────────
       - name: アーティファクトを保存
         if: always()
