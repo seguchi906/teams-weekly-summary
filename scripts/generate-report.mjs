@@ -79,7 +79,7 @@ async function fetchSectionStats(sql) {
               AND COALESCE(
                     (p->>'revisedEndDate')::DATE,
                     (p->>'endDate')::DATE
-                  ) <= CURRENT_DATE + ${HIGH_RISK_DAYS}
+                  ) <= CURRENT_DATE + (${HIGH_RISK_DAYS})::int
              THEN 1 ELSE 0 END
       )                                         AS high_risk_count
     FROM app_data,
