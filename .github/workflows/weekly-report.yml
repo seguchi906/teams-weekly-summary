@@ -7,16 +7,21 @@ on:
   # GitHub 画面から手動実行も可能
   workflow_dispatch:
 
+permissions:
+  contents: write  # gh-pages ブランチへのプッシュに必要
+
 jobs:
   report:
     runs-on: ubuntu-latest
 
     steps:
       # ─────────────────────────────────────────
-      # 1. リポジトリのチェックアウト
+      # 1. リポジトリのチェックアウト（全履歴取得）
       # ─────────────────────────────────────────
       - name: リポジトリをチェックアウト
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # ─────────────────────────────────────────
       # 2. Node.js のセットアップ
@@ -41,26 +46,35 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       # ─────────────────────────────────────────
-      # 5. レポート生成・Teams 投稿
+      # 5. レポート生成・Teams 通知送信
       #    generate-report.mjs が以下を行う:
       #      - Neon DB からデータ取得・集計
       #      - HTML テンプレートにデータを埋め込む
       #      - Playwright でスクリーンショット撮影
-      #      - Graph API で Teams チャンネルに直接投稿
+      #      - Teams Incoming Webhook に Adaptive Card 送信
       # ─────────────────────────────────────────
-      - name: レポートを生成して Teams に投稿
+      - name: レポートを生成して Teams に送信
         run: node scripts/generate-report.mjs
         env:
           DATABASE_URL: ${{ secrets.OVERALL_PROJECT_SCHEDULE }}
           PROGRESS_BASHBOARD_URL: ${{ secrets.PROGRESS_BASHBOARD }}
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          TEAMS_TEAM_ID: ${{ secrets.TEAMS_TEAM_ID }}
-          TEAMS_CHANNEL_ID: ${{ secrets.TEAMS_CHANNEL_ID }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          PAGES_BASE_URL: ${{ vars.PAGES_BASE_URL }}
 
       # ─────────────────────────────────────────
-      # 6. 生成ファイルをアーティファクトとして保存（デバッグ用）
+      # 6. スクリーンショットを GitHub Pages に公開
+      #    peaceiris/actions-gh-pages で gh-pages ブランチを自動管理
+      # ─────────────────────────────────────────
+      - name: GitHub Pages にスクリーンショットを公開
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
+          keep_files: false
+          commit_message: "chore: 週次レポート更新"
+
+      # ─────────────────────────────────────────
+      # 7. 生成ファイルをアーティファクトとして保存（デバッグ用）
       # ─────────────────────────────────────────
       - name: アーティファクトを保存
         if: always()

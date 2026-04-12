@@ -9,16 +9,13 @@
  *   3. projectId / projectName でジョインし、生産金額 = 受注金額 × 進捗率 を課ごとに集計
  *   4. index.html テンプレートにデータを埋め込んで dist/report.html を生成
  *   5. Playwright でスクリーンショット → dist/report-latest.png
- *   6. Microsoft Graph API で Teams チャンネルにインライン画像付きメッセージを投稿
+ *   6. Teams Incoming Webhook に Adaptive Card を送信
  *
  * 必要な環境変数:
  *   DATABASE_URL            - OVERALL_PROJECT_SCHEDULE（受注金額）の Neon 接続文字列
  *   PROGRESS_BASHBOARD_URL  - PROGRESS_BASHBOARD（進捗率）の Neon 接続文字列
- *   AZURE_TENANT_ID         - Azure AD テナント ID
- *   AZURE_CLIENT_ID         - Azure AD アプリ クライアント ID
- *   AZURE_CLIENT_SECRET     - Azure AD アプリ クライアントシークレット
- *   TEAMS_TEAM_ID           - 投稿先 Teams チームの ID
- *   TEAMS_CHANNEL_ID        - 投稿先チャンネルの ID
+ *   TEAMS_WEBHOOK_URL       - Teams チャネルの Incoming Webhook URL
+ *   PAGES_BASE_URL          - GitHub Pages のベース URL（例: https://user.github.io/repo）
  *
  * 両 DB のスキーマ想定:
  *   app_data テーブル, key = 'projects', value は JSONB 配列。
@@ -367,92 +364,77 @@ async function takeScreenshot(htmlPath, outputPath) {
 // ──────────────────────────────────────────────
 
 /**
- * Microsoft Graph API で Teams チャンネルにインライン画像付きメッセージを投稿する。
+ * Teams Incoming Webhook に Adaptive Card を送信する。
  *
  * @param {{
- *   tenantId: string;
- *   clientId: string;
- *   clientSecret: string;
- *   teamId: string;
- *   channelId: string;
+ *   webhookUrl: string;
  *   dateLabel: string;
- *   imageBuffer: Buffer;
+ *   imageUrl: string;
  *   totalAmount: string;
  *   highRiskDept: string;
  * }} opts
  */
-async function sendTeamsMessage(opts) {
-  const {
-    tenantId,
-    clientId,
-    clientSecret,
-    teamId,
-    channelId,
-    dateLabel,
-    imageBuffer,
-    totalAmount,
-    highRiskDept,
-  } = opts;
+async function sendTeamsNotification(opts) {
+  const { webhookUrl, dateLabel, imageUrl, totalAmount, highRiskDept } = opts;
 
-  const tokenRes = await fetch(
-    `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "client_credentials",
-        client_id: clientId,
-        client_secret: clientSecret,
-        scope: "https://graph.microsoft.com/.default",
-      }),
-    }
-  );
-
-  if (!tokenRes.ok) {
-    const body = await tokenRes.text();
-    throw new Error(
-      `トークン取得失敗: HTTP ${tokenRes.status} ${tokenRes.statusText}\n${body}`
-    );
-  }
-
-  const { access_token } = await tokenRes.json();
-
-  const imageBase64 = imageBuffer.toString("base64");
-  const res = await fetch(
-    `https://graph.microsoft.com/v1.0/teams/${teamId}/channels/${channelId}/messages`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${access_token}`,
-      },
-      body: JSON.stringify({
-        subject: `週次レポート ${dateLabel}`,
-        body: {
-          contentType: "html",
-          content:
-            `<p>合計生産額: <strong>${totalAmount} 万円</strong> / 高リスク該当: <strong>${highRiskDept}</strong></p>` +
-            `<img src="../hostedContents/1/$value" style="max-width:700px" />`,
+  const payload = {
+    type: "message",
+    attachments: [
+      {
+        contentType: "application/vnd.microsoft.card.adaptive",
+        contentUrl: null,
+        content: {
+          $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+          type: "AdaptiveCard",
+          version: "1.4",
+          body: [
+            {
+              type: "TextBlock",
+              text: `週次レポート　${dateLabel}`,
+              weight: "Bolder",
+              size: "Medium",
+              wrap: true,
+            },
+            {
+              type: "FactSet",
+              facts: [
+                { title: "合計生産額", value: `${totalAmount} 万円` },
+                { title: "高リスク該当", value: highRiskDept || "なし" },
+              ],
+            },
+            {
+              type: "Image",
+              url: imageUrl,
+              altText: `週次レポート ${dateLabel}`,
+              size: "Stretch",
+            },
+          ],
+          actions: [
+            {
+              type: "Action.OpenUrl",
+              title: "レポートを開く",
+              url: imageUrl,
+            },
+          ],
         },
-        hostedContents: [
-          {
-            "@microsoft.graph.temporaryId": "1",
-            contentBytes: imageBase64,
-            contentType: "image/png",
-          },
-        ],
-      }),
-    }
-  );
+      },
+    ],
+  };
+
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 
   if (!res.ok) {
     const body = await res.text();
     throw new Error(
-      `Teams メッセージ投稿失敗: HTTP ${res.status} ${res.statusText}\n${body}`
+      `Teams webhook 送信失敗: HTTP ${res.status} ${res.statusText}\n${body}`
     );
   }
 
-  console.log("Teams へのメッセージを投稿しました。");
+  console.log("Teams への通知を送信しました。");
 }
 
 // ──────────────────────────────────────────────
@@ -463,19 +445,14 @@ async function main() {
   // ── 環境変数チェック ──
   const DATABASE_URL           = process.env.DATABASE_URL;
   const PROGRESS_BASHBOARD_URL = process.env.PROGRESS_BASHBOARD_URL;
-  const AZURE_TENANT_ID        = process.env.AZURE_TENANT_ID;
-  const AZURE_CLIENT_ID        = process.env.AZURE_CLIENT_ID;
-  const AZURE_CLIENT_SECRET    = process.env.AZURE_CLIENT_SECRET;
-  const TEAMS_TEAM_ID          = process.env.TEAMS_TEAM_ID;
-  const TEAMS_CHANNEL_ID       = process.env.TEAMS_CHANNEL_ID;
+  const TEAMS_WEBHOOK_URL      = process.env.TEAMS_WEBHOOK_URL;
+  const PAGES_BASE_URL         = process.env.PAGES_BASE_URL ?? "";
 
   if (!DATABASE_URL)           throw new Error("環境変数 DATABASE_URL が未設定です。");
   if (!PROGRESS_BASHBOARD_URL) throw new Error("環境変数 PROGRESS_BASHBOARD_URL が未設定です。");
-  if (!AZURE_TENANT_ID)        throw new Error("環境変数 AZURE_TENANT_ID が未設定です。");
-  if (!AZURE_CLIENT_ID)        throw new Error("環境変数 AZURE_CLIENT_ID が未設定です。");
-  if (!AZURE_CLIENT_SECRET)    throw new Error("環境変数 AZURE_CLIENT_SECRET が未設定です。");
-  if (!TEAMS_TEAM_ID)          throw new Error("環境変数 TEAMS_TEAM_ID が未設定です。");
-  if (!TEAMS_CHANNEL_ID)       throw new Error("環境変数 TEAMS_CHANNEL_ID が未設定です。");
+  if (!TEAMS_WEBHOOK_URL)      throw new Error("環境変数 TEAMS_WEBHOOK_URL が未設定です。");
+  if (!PAGES_BASE_URL)
+    console.warn("警告: PAGES_BASE_URL が未設定です。Teams の画像 URL が不正になります。");
 
   // ── 日付ラベル ──
   const now = new Date();
@@ -585,18 +562,14 @@ async function main() {
   await takeScreenshot(reportHtmlPath, reportPngPath);
   console.log(`スクリーンショットを保存しました: ${reportPngPath}`);
 
-  // ── Teams メッセージ投稿 ──
-  console.log("Teams にメッセージを投稿しています...");
-  const imageBuffer = await readFile(reportPngPath);
+  // ── Teams 通知送信 ──
+  const imageUrl = `${PAGES_BASE_URL}/report-latest.png`;
+  console.log(`Teams に通知を送信しています... (画像URL: ${imageUrl})`);
 
-  await sendTeamsMessage({
-    tenantId:     AZURE_TENANT_ID,
-    clientId:     AZURE_CLIENT_ID,
-    clientSecret: AZURE_CLIENT_SECRET,
-    teamId:       TEAMS_TEAM_ID,
-    channelId:    TEAMS_CHANNEL_ID,
+  await sendTeamsNotification({
+    webhookUrl:   TEAMS_WEBHOOK_URL,
     dateLabel,
-    imageBuffer,
+    imageUrl,
     totalAmount:  totalAmountLabel,
     highRiskDept: highRiskDeptLabel,
   });
