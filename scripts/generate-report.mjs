@@ -16,7 +16,7 @@
  */
 
 import { neon } from "@neondatabase/serverless";
-import { readFile, writeFile } from "fs/promises";
+import { mkdir, readFile, writeFile } from "fs/promises";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import puppeteer from "puppeteer";
@@ -460,13 +460,16 @@ async function main() {
     .replace("{{HIGH_RISK_DEPT}}", highRiskDeptLabel)
     .replace("{{DEPT_ROWS}}", deptRows);
 
-  const reportHtmlPath = join(ROOT, "dist", "report.html");
+  const distDir = join(ROOT, "dist");
+  await mkdir(distDir, { recursive: true });
+
+  const reportHtmlPath = join(distDir, "report.html");
   await writeFile(reportHtmlPath, html, "utf-8");
   console.log(`HTML を生成しました: ${reportHtmlPath}`);
 
   // ── スクリーンショット ──
   console.log("スクリーンショットを撮影しています...");
-  const reportPngPath = join(ROOT, "dist", "report-latest.png");
+  const reportPngPath = join(distDir, "report-latest.png");
   await takeScreenshot(reportHtmlPath, reportPngPath);
   console.log(`スクリーンショットを保存しました: ${reportPngPath}`);
 
