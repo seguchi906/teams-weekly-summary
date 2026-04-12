@@ -4,22 +4,39 @@
  * 週次 Teams レポートを自動生成・送信するメインスクリプト。
  *
  * 処理の流れ:
- *   1. Neon DB からプロジェクトデータを取得・集計
- *   2. index.html テンプレートにデータを埋め込んで dist/report.html を生成
- *   3. Puppeteer でスクリーンショット → dist/report-latest.png
- *   4. Microsoft Teams Incoming Webhook に Adaptive Card を送信
+ *   1. OVERALL_PROJECT_SCHEDULE DB からプロジェクト（受注金額・担当課）を取得
+ *   2. PROGRESS_BASHBOARD DB から進捗率を取得
+ *   3. projectId / projectName でジョインし、生産金額 = 受注金額 × 進捗率 を課ごとに集計
+ *   4. index.html テンプレートにデータを埋め込んで dist/report.html を生成
+ *   5. Playwright でスクリーンショット → dist/report-latest.png
+ *   6. Microsoft Graph API で Teams チャンネルにインライン画像付きメッセージを投稿
  *
  * 必要な環境変数:
- *   DATABASE_URL    - Neon の接続文字列
- *   TEAMS_WEBHOOK_URL - Teams チャネルの Incoming Webhook URL
- *   PAGES_BASE_URL  - GitHub Pages のベース URL（例: https://user.github.io/repo）
+ *   DATABASE_URL            - OVERALL_PROJECT_SCHEDULE（受注金額）の Neon 接続文字列
+ *   PROGRESS_BASHBOARD_URL  - PROGRESS_BASHBOARD（進捗率）の Neon 接続文字列
+ *   AZURE_TENANT_ID         - Azure AD テナント ID
+ *   AZURE_CLIENT_ID         - Azure AD アプリ クライアント ID
+ *   AZURE_CLIENT_SECRET     - Azure AD アプリ クライアントシークレット
+ *   TEAMS_TEAM_ID           - 投稿先 Teams チームの ID
+ *   TEAMS_CHANNEL_ID        - 投稿先チャンネルの ID
+ *
+ * 両 DB のスキーマ想定:
+ *   app_data テーブル, key = 'projects', value は JSONB 配列。
+ *
+ *   OVERALL_PROJECT_SCHEDULE の各要素:
+ *     { id, projectName, status, responsibleSections: [...],
+ *       allocationSection1, allocationSection2, allocationSection3,
+ *       revisedEndDate, endDate }
+ *
+ *   PROGRESS_BASHBOARD の各要素:
+ *     { id, projectName, progress }   ← progress は 0〜100 の数値
  */
 
 import { neon } from "@neondatabase/serverless";
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
-import puppeteer from "puppeteer";
+import { chromium } from "playwright";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
@@ -39,101 +56,181 @@ const SECTIONS = ["1課", "2課", "3課"];
 // ──────────────────────────────────────────────
 
 /**
- * 各課の集計データを取得する。
- *
- * progress-dashboard が使用する Neon DB のスキーマ:
- *
- *   CREATE TABLE app_data (
- *     key        VARCHAR(50) PRIMARY KEY,
- *     value      JSONB NOT NULL,
- *     updated_at TIMESTAMPTZ DEFAULT NOW()
- *   );
- *
- *   key='projects' の value にプロジェクト配列が JSONB で保存されている。
- *   各プロジェクトのキーは camelCase（例: allocationSection1, responsibleSections）。
+ * OVERALL_PROJECT_SCHEDULE DB から全プロジェクトを取得する。
+ * ステータスフィルタはかけず、JS 側で振り分ける。
  *
  * @param {import("@neondatabase/serverless").NeonQueryFunction} sql
- * @returns {Promise<SectionStat[]>}
+ * @returns {Promise<Object[]>} プロジェクトオブジェクトの配列
  */
-async function fetchSectionStats(sql) {
-  /**
-   * app_data の JSONB 配列を jsonb_array_elements で展開し、
-   * さらに responsibleSections 配列を jsonb_array_elements_text で展開して課ごとに集計する。
-   * 「実質の終了日」は revisedEndDate があればそちらを優先する。
-   * responsibleSections が未設定のプロジェクトは COALESCE で空配列扱いとしてスキップ。
-   */
+async function fetchAllProjects(sql) {
   const rows = await sql`
-    SELECT
-      sec                                       AS section,
-      SUM(
-        CASE sec
-          WHEN '1課' THEN COALESCE((p->>'allocationSection1')::BIGINT, 0)
-          WHEN '2課' THEN COALESCE((p->>'allocationSection2')::BIGINT, 0)
-          WHEN '3課' THEN COALESCE((p->>'allocationSection3')::BIGINT, 0)
-          ELSE 0
-        END
-      )                                         AS total_allocation,
-      COUNT(*)                                  AS total_count,
-      SUM(
-        CASE WHEN p->>'status' = '進行中'
-              AND COALESCE(
-                    (p->>'revisedEndDate')::DATE,
-                    (p->>'endDate')::DATE
-                  ) <= CURRENT_DATE + (${HIGH_RISK_DAYS})::int
-             THEN 1 ELSE 0 END
-      )                                         AS high_risk_count
-    FROM app_data,
-         jsonb_array_elements(value) AS p,
-         jsonb_array_elements_text(
-           COALESCE(p->'responsibleSections', '[]'::jsonb)
-         ) AS sec
-    WHERE key = 'projects'
-      AND p->>'status' NOT IN ('完納', '仮納品')
-    GROUP BY sec
-    ORDER BY sec
+    SELECT p AS project
+    FROM   app_data,
+           jsonb_array_elements(value) AS p
+    WHERE  key = 'projects'
   `;
-
-  return rows;
+  return rows.map((r) => r.project);
 }
 
 /**
- * 先週の各課配分合計を取得して「先週比」を計算するためのクエリ。
- * 先週に完納 or 仮納品になった業務の配分額を「先週の生産額」とみなす。
+ * PROGRESS_BASHBOARD DB から業務番号ごとの現在進捗率（0〜100）マップを取得する。
+ *
+ * スキーマ想定:
+ *   { id: "46-003", name: "...", weeklyProgress: [null, 30, 60, null, 75, ...] }
+ *
+ * `id` が OVERALL_PROJECT_SCHEDULE の `number`（業務番号）と対応する結合キー。
+ * 現在進捗は weeklyProgress の末尾から遡って最初の非 null 値を使用する。
  *
  * @param {import("@neondatabase/serverless").NeonQueryFunction} sql
- * @returns {Promise<Record<string, number>>} section → 先週の配分合計（円）
+ * @returns {Promise<Map<string, number>>} 業務番号 → 現在進捗率（0〜100）
  */
-async function fetchLastWeekAllocation(sql) {
+async function fetchProgressRates(sql) {
   const rows = await sql`
-    SELECT
-      sec,
-      SUM(
-        CASE sec
-          WHEN '1課' THEN COALESCE((p->>'allocationSection1')::BIGINT, 0)
-          WHEN '2課' THEN COALESCE((p->>'allocationSection2')::BIGINT, 0)
-          WHEN '3課' THEN COALESCE((p->>'allocationSection3')::BIGINT, 0)
-          ELSE 0
-        END
-      ) AS last_week_allocation
-    FROM app_data,
-         jsonb_array_elements(value) AS p,
-         jsonb_array_elements_text(
-           COALESCE(p->'responsibleSections', '[]'::jsonb)
-         ) AS sec
-    WHERE key = 'projects'
-      AND p->>'status' IN ('完納', '仮納品')
-      AND COALESCE(
-            (p->>'revisedEndDate')::DATE,
-            (p->>'endDate')::DATE
-          ) BETWEEN CURRENT_DATE - 14 AND CURRENT_DATE - 7
-    GROUP BY sec
+    SELECT p AS project
+    FROM   app_data,
+           jsonb_array_elements(value) AS p
+    WHERE  key = 'projects'
   `;
 
-  /** @type {Record<string, number>} */
-  const map = {};
-  for (const row of rows) {
-    map[row.sec] = Number(row.last_week_allocation ?? 0);
+  const map = new Map();
+  for (const { project } of rows) {
+    if (project.id == null) continue;
+    const weeklyProgress = Array.isArray(project.weeklyProgress)
+      ? project.weeklyProgress
+      : [];
+    const currentProgress =
+      [...weeklyProgress].reverse().find((v) => v != null) ?? 0;
+    map.set(String(project.id), Number(currentProgress));
   }
+  return map;
+}
+
+// ──────────────────────────────────────────────
+// 生産金額の集計（JS ジョイン）
+// ──────────────────────────────────────────────
+
+/**
+ * overall.number === progress.id でジョインし、課ごとの生産金額を集計する。
+ *
+ * 生産金額の計算:
+ *   section1Production = allocationSection1 * currentProgress / 100
+ *   section2Production = allocationSection2 * currentProgress / 100
+ *   section3Production = allocationSection3 * currentProgress / 100
+ *
+ * totalCount / highRiskCount は responsibleSections を使って課ごとにカウントする。
+ *
+ * @param {Object[]} projects       OVERALL_PROJECT_SCHEDULE から取得した全プロジェクト
+ * @param {Map<string, number>} progressMap  業務番号 → 現在進捗率（0〜100）
+ * @returns {{
+ *   sectionMap: Map<string, {production: number; highRiskCount: number; totalCount: number}>;
+ *   matchedCount: number;
+ *   unmatchedOverallCount: number;
+ *   unmatchedProgressCount: number;
+ * }}
+ */
+function computeSectionStats(projects, progressMap) {
+  const sectionMap = new Map(
+    SECTIONS.map((sec) => [sec, { production: 0, highRiskCount: 0, totalCount: 0 }])
+  );
+
+  let matchedCount = 0;
+  let unmatchedOverallCount = 0;
+  const matchedProgressIds = new Set();
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  for (const project of projects) {
+    if (["完納", "仮納品"].includes(project.status)) continue;
+
+    // 結合キー: overall.number === progress.id（業務番号）
+    const businessNumber = String(project.number ?? "");
+    const currentProgress = progressMap.get(businessNumber); // 0〜100 or undefined
+
+    if (currentProgress == null) {
+      unmatchedOverallCount++;
+    } else {
+      matchedCount++;
+      matchedProgressIds.add(businessNumber);
+    }
+
+    const effectivePct = currentProgress ?? 0; // 未マッチは進捗 0% 扱い
+
+    // 各課の生産金額 = 配分額 × 進捗率 / 100
+    const alloc1 = Number(project.allocationSection1 ?? 0);
+    const alloc2 = Number(project.allocationSection2 ?? 0);
+    const alloc3 = Number(project.allocationSection3 ?? 0);
+    sectionMap.get("1課").production += Math.floor(alloc1 * effectivePct / 100);
+    sectionMap.get("2課").production += Math.floor(alloc2 * effectivePct / 100);
+    sectionMap.get("3課").production += Math.floor(alloc3 * effectivePct / 100);
+
+    // 高リスク判定（納期まで HIGH_RISK_DAYS 日以内かつ「進行中」）
+    const rawEndDate = project.revisedEndDate ?? project.endDate ?? null;
+    const isHighRisk =
+      project.status === "進行中" &&
+      rawEndDate != null &&
+      (new Date(rawEndDate) - today) / 86400000 <= HIGH_RISK_DAYS;
+
+    // totalCount / highRiskCount は responsibleSections 単位でカウント
+    const sections = Array.isArray(project.responsibleSections)
+      ? project.responsibleSections
+      : [];
+    for (const sec of sections) {
+      if (!sectionMap.has(sec)) continue;
+      const d = sectionMap.get(sec);
+      d.totalCount++;
+      if (isHighRisk) d.highRiskCount++;
+    }
+  }
+
+  // progressMap のうち overall と結合できなかった件数
+  const unmatchedProgressCount = [...progressMap.keys()].filter(
+    (id) => !matchedProgressIds.has(id)
+  ).length;
+
+  return { sectionMap, matchedCount, unmatchedOverallCount, unmatchedProgressCount };
+}
+
+/**
+ * 先週（CURRENT_DATE-14 〜 CURRENT_DATE-7）に完納／仮納品になった
+ * プロジェクトの課ごと生産金額合計を返す（先週比の計算に使用）。
+ *
+ * 結合キー: overall.number === progress.id（業務番号）
+ * 完納案件は進捗率マップにあればその値を使い、なければ 100% とみなす。
+ *
+ * @param {Object[]} projects
+ * @param {Map<string, number>} progressMap  業務番号 → 現在進捗率（0〜100）
+ * @returns {Record<string, number>} section → 先週の生産金額合計（円）
+ */
+function computeLastWeekProduction(projects, progressMap) {
+  const map = {};
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const sevenDaysAgo    = new Date(today); sevenDaysAgo.setDate(today.getDate() - 7);
+  const fourteenDaysAgo = new Date(today); fourteenDaysAgo.setDate(today.getDate() - 14);
+
+  for (const project of projects) {
+    if (!["完納", "仮納品"].includes(project.status)) continue;
+
+    const rawEndDate = project.revisedEndDate ?? project.endDate ?? null;
+    if (rawEndDate == null) continue;
+
+    const endDate = new Date(rawEndDate);
+    if (endDate < fourteenDaysAgo || endDate > sevenDaysAgo) continue;
+
+    // 結合キー: overall.number === progress.id（業務番号）
+    const businessNumber = String(project.number ?? "");
+    const pct = progressMap.get(businessNumber) ?? 100; // 完納はデフォルト 100%
+
+    const alloc1 = Number(project.allocationSection1 ?? 0);
+    const alloc2 = Number(project.allocationSection2 ?? 0);
+    const alloc3 = Number(project.allocationSection3 ?? 0);
+
+    map["1課"] = (map["1課"] ?? 0) + Math.floor(alloc1 * pct / 100);
+    map["2課"] = (map["2課"] ?? 0) + Math.floor(alloc2 * pct / 100);
+    map["3課"] = (map["3課"] ?? 0) + Math.floor(alloc3 * pct / 100);
+  }
+
   return map;
 }
 
@@ -183,33 +280,26 @@ function weekOverWeekDisplay(current, last) {
  *
  * @param {{
  *   section: string;
- *   allocation: number;
- *   lastAllocation: number;
+ *   production: number;
+ *   lastProduction: number;
  *   highRiskCount: number;
  *   totalCount: number;
  * }} stat
  * @returns {string}
  */
 function buildDeptRow(stat) {
-  const { section, allocation, lastAllocation, highRiskCount, totalCount } =
-    stat;
+  const { section, production, lastProduction, highRiskCount, totalCount } = stat;
 
   const isHigh = highRiskCount > 0;
-  const riskLevel = isHigh ? "high" : "low";
-  const riskBg = isHigh ? "bg-red-50/60" : "bg-blue-50/60";
-  const badgeColor = isHigh
-    ? "bg-red-100 text-red-700"
-    : "bg-blue-100 text-blue-700";
-  const dotColor = isHigh ? "bg-red-500" : "bg-blue-500";
-  const statusLabel = isHigh ? "危険" : "安全";
-  const ariaLabel = `高リスク業務: ${statusLabel}（${totalCount}件中${highRiskCount}件）`;
+  const riskLevel   = isHigh ? "high" : "low";
+  const riskBg      = isHigh ? "bg-red-50/60"              : "bg-blue-50/60";
+  const badgeColor  = isHigh ? "bg-red-100 text-red-700"   : "bg-blue-100 text-blue-700";
+  const dotColor    = isHigh ? "bg-red-500"                 : "bg-blue-500";
+  const statusLabel = isHigh ? "危険"                       : "安全";
+  const ariaLabel   = `高リスク業務: ${statusLabel}（${totalCount}件中${highRiskCount}件）`;
 
-  const { arrow, colorClass, label } = weekOverWeekDisplay(
-    allocation,
-    lastAllocation
-  );
-
-  const amountManYen = toManYen(allocation);
+  const { arrow, colorClass, label } = weekOverWeekDisplay(production, lastProduction);
+  const amountManYen = toManYen(production);
 
   return `
             <tr data-risk-level="${riskLevel}" class="transition-colors hover:bg-slate-50/50">
@@ -246,31 +336,23 @@ function buildDeptRow(stat) {
 // ──────────────────────────────────────────────
 
 /**
- * Puppeteer で HTML をスクリーンショット撮影し PNG ファイルに保存する。
+ * Playwright で HTML をスクリーンショット撮影し PNG ファイルに保存する。
  *
  * @param {string} htmlPath 読み込む HTML ファイルの絶対パス（file:// URL）
  * @param {string} outputPath 出力 PNG ファイルのパス
  */
 async function takeScreenshot(htmlPath, outputPath) {
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-    ],
+  const browser = await chromium.launch({
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
 
   try {
     const page = await browser.newPage();
-    await page.setViewport({ width: 720, height: 900, deviceScaleFactor: 2 });
-    await page.goto(`file://${htmlPath}`, { waitUntil: "networkidle0" });
+    await page.setViewportSize({ width: 720, height: 900 });
+    await page.goto(`file://${htmlPath}`, { waitUntil: "networkidle" });
 
-    // Tailwind の CDN スタイルが適用されるまで少し待機
-    await new Promise((r) => setTimeout(r, 1500));
-
-    const card = await page.$(".max-w-2xl");
-    if (card) {
+    const card = page.locator(".max-w-2xl");
+    if (await card.count() > 0) {
       await card.screenshot({ path: outputPath, type: "png" });
     } else {
       await page.screenshot({ path: outputPath, fullPage: true, type: "png" });
@@ -285,80 +367,92 @@ async function takeScreenshot(htmlPath, outputPath) {
 // ──────────────────────────────────────────────
 
 /**
- * Teams Incoming Webhook に Adaptive Card を送信する。
+ * Microsoft Graph API で Teams チャンネルにインライン画像付きメッセージを投稿する。
  *
  * @param {{
- *   webhookUrl: string;
+ *   tenantId: string;
+ *   clientId: string;
+ *   clientSecret: string;
+ *   teamId: string;
+ *   channelId: string;
  *   dateLabel: string;
- *   imageUrl: string;
+ *   imageBuffer: Buffer;
  *   totalAmount: string;
  *   highRiskDept: string;
  * }} opts
  */
-async function sendTeamsNotification(opts) {
-  const { webhookUrl, dateLabel, imageUrl, totalAmount, highRiskDept } = opts;
+async function sendTeamsMessage(opts) {
+  const {
+    tenantId,
+    clientId,
+    clientSecret,
+    teamId,
+    channelId,
+    dateLabel,
+    imageBuffer,
+    totalAmount,
+    highRiskDept,
+  } = opts;
 
-  const payload = {
-    type: "message",
-    attachments: [
-      {
-        contentType: "application/vnd.microsoft.card.adaptive",
-        contentUrl: null,
-        content: {
-          $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
-          type: "AdaptiveCard",
-          version: "1.4",
-          body: [
-            {
-              type: "TextBlock",
-              text: `週次レポート　${dateLabel}`,
-              weight: "Bolder",
-              size: "Medium",
-              wrap: true,
-            },
-            {
-              type: "FactSet",
-              facts: [
-                { title: "合計生産額", value: `${totalAmount} 万円` },
-                {
-                  title: "高リスク該当",
-                  value: highRiskDept || "なし",
-                },
-              ],
-            },
-            {
-              type: "Image",
-              url: imageUrl,
-              altText: `週次レポート ${dateLabel}`,
-              size: "Stretch",
-            },
-          ],
-          actions: [
-            {
-              type: "Action.OpenUrl",
-              title: "レポートを開く",
-              url: imageUrl,
-            },
-          ],
-        },
+  const tokenRes = await fetch(
+    `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: clientId,
+        client_secret: clientSecret,
+        scope: "https://graph.microsoft.com/.default",
+      }),
+    }
+  );
+
+  if (!tokenRes.ok) {
+    const body = await tokenRes.text();
+    throw new Error(
+      `トークン取得失敗: HTTP ${tokenRes.status} ${tokenRes.statusText}\n${body}`
+    );
+  }
+
+  const { access_token } = await tokenRes.json();
+
+  const imageBase64 = imageBuffer.toString("base64");
+  const res = await fetch(
+    `https://graph.microsoft.com/v1.0/teams/${teamId}/channels/${channelId}/messages`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${access_token}`,
       },
-    ],
-  };
-
-  const res = await fetch(webhookUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+      body: JSON.stringify({
+        subject: `週次レポート ${dateLabel}`,
+        body: {
+          contentType: "html",
+          content:
+            `<p>合計生産額: <strong>${totalAmount} 万円</strong> / 高リスク該当: <strong>${highRiskDept}</strong></p>` +
+            `<img src="../hostedContents/1/$value" style="max-width:700px" />`,
+        },
+        hostedContents: [
+          {
+            "@microsoft.graph.temporaryId": "1",
+            contentBytes: imageBase64,
+            contentType: "image/png",
+          },
+        ],
+      }),
+    }
+  );
 
   if (!res.ok) {
     const body = await res.text();
     throw new Error(
-      `Teams webhook 送信失敗: HTTP ${res.status} ${res.statusText}\n${body}`
+      `Teams メッセージ投稿失敗: HTTP ${res.status} ${res.statusText}\n${body}`
     );
   }
 
-  console.log("Teams への通知を送信しました。");
+  console.log("Teams へのメッセージを投稿しました。");
 }
 
 // ──────────────────────────────────────────────
@@ -367,17 +461,21 @@ async function sendTeamsNotification(opts) {
 
 async function main() {
   // ── 環境変数チェック ──
-  const DATABASE_URL = process.env.DATABASE_URL;
-  const TEAMS_WEBHOOK_URL = process.env.TEAMS_WEBHOOK_URL;
-  const PAGES_BASE_URL = process.env.PAGES_BASE_URL ?? "";
+  const DATABASE_URL           = process.env.DATABASE_URL;
+  const PROGRESS_BASHBOARD_URL = process.env.PROGRESS_BASHBOARD_URL;
+  const AZURE_TENANT_ID        = process.env.AZURE_TENANT_ID;
+  const AZURE_CLIENT_ID        = process.env.AZURE_CLIENT_ID;
+  const AZURE_CLIENT_SECRET    = process.env.AZURE_CLIENT_SECRET;
+  const TEAMS_TEAM_ID          = process.env.TEAMS_TEAM_ID;
+  const TEAMS_CHANNEL_ID       = process.env.TEAMS_CHANNEL_ID;
 
-  if (!DATABASE_URL) throw new Error("環境変数 DATABASE_URL が未設定です。");
-  if (!TEAMS_WEBHOOK_URL)
-    throw new Error("環境変数 TEAMS_WEBHOOK_URL が未設定です。");
-  if (!PAGES_BASE_URL)
-    console.warn(
-      "警告: PAGES_BASE_URL が未設定です。Teams の画像 URL が不正になります。"
-    );
+  if (!DATABASE_URL)           throw new Error("環境変数 DATABASE_URL が未設定です。");
+  if (!PROGRESS_BASHBOARD_URL) throw new Error("環境変数 PROGRESS_BASHBOARD_URL が未設定です。");
+  if (!AZURE_TENANT_ID)        throw new Error("環境変数 AZURE_TENANT_ID が未設定です。");
+  if (!AZURE_CLIENT_ID)        throw new Error("環境変数 AZURE_CLIENT_ID が未設定です。");
+  if (!AZURE_CLIENT_SECRET)    throw new Error("環境変数 AZURE_CLIENT_SECRET が未設定です。");
+  if (!TEAMS_TEAM_ID)          throw new Error("環境変数 TEAMS_TEAM_ID が未設定です。");
+  if (!TEAMS_CHANNEL_ID)       throw new Error("環境変数 TEAMS_CHANNEL_ID が未設定です。");
 
   // ── 日付ラベル ──
   const now = new Date();
@@ -389,63 +487,77 @@ async function main() {
 
   console.log(`レポート生成開始: ${dateLabel}`);
 
-  // ── Neon DB 接続 ──
-  const sql = neon(DATABASE_URL);
+  // ── 2つの Neon DB に接続 ──
+  const sqlOverall   = neon(DATABASE_URL);
+  const sqlProgress  = neon(PROGRESS_BASHBOARD_URL);
 
-  // ── データ取得 ──
-  console.log("Neon DB からデータを取得しています...");
-  const [sectionStats, lastWeekMap] = await Promise.all([
-    fetchSectionStats(sql),
-    fetchLastWeekAllocation(sql),
+  // ── 両 DB から並列取得 ──
+  console.log("両 DB からデータを取得しています...");
+  const [allProjects, progressMap] = await Promise.all([
+    fetchAllProjects(sqlOverall),
+    fetchProgressRates(sqlProgress),
   ]);
 
-  // ── データが空の場合の処理 ──
-  if (sectionStats.length === 0) {
+  console.log(`  overall 案件数: ${allProjects.length} 件`);
+  console.log(`  progress 案件数: ${progressMap.size} 件`);
+
+  // ── JS 側でジョイン → 生産金額を集計 ──
+  // 結合キー: overall.number === progress.id（業務番号）
+  const { sectionMap, matchedCount, unmatchedOverallCount, unmatchedProgressCount } =
+    computeSectionStats(allProjects, progressMap);
+
+  console.log(`  結合できた件数:                  ${matchedCount} 件`);
+  console.log(`  結合できなかった overall 案件数: ${unmatchedOverallCount} 件（進捗率 0% 扱い）`);
+  console.log(`  結合できなかった progress 案件数: ${unmatchedProgressCount} 件`);
+
+  if (matchedCount === 0) {
     console.warn(
-      "警告: 取得したデータが0件でした。DB のスキーマやクエリを確認してください。"
+      "警告: 結合できた案件が 0 件でした。overall.number と progress.id の値を確認してください。"
     );
   }
 
-  // ── 各課データを整形 ──
-  /** @type {Map<string, {allocation: number; highRiskCount: number; totalCount: number}>} */
-  const sectionMap = new Map();
-
-  for (const row of sectionStats) {
-    sectionMap.set(row.section, {
-      allocation: Number(row.total_allocation ?? 0),
-      highRiskCount: Number(row.high_risk_count ?? 0),
-      totalCount: Number(row.total_count ?? 0),
-    });
-  }
+  // ── 先週の生産金額（先週比用） ──
+  const lastWeekMap = computeLastWeekProduction(allProjects, progressMap);
 
   // ── サマリー集計 ──
-  let totalAllocationYen = 0;
+  let totalProductionYen = 0;
   const highRiskSections = [];
 
   for (const sec of SECTIONS) {
     const d = sectionMap.get(sec);
     if (!d) continue;
-    totalAllocationYen += d.allocation;
+    totalProductionYen += d.production;
     if (d.highRiskCount > 0) highRiskSections.push(sec);
   }
 
-  const totalAmountLabel = toManYen(totalAllocationYen);
+  const totalAmountLabel  = toManYen(totalProductionYen);
   const highRiskDeptLabel =
     highRiskSections.length > 0 ? highRiskSections.join("・") : "なし";
 
+  // ── 課ごとの生産金額をコンソールに出力 ──
+  console.log("\n─── 課ごとの合計生産金額 ───────────────────");
+  for (const sec of SECTIONS) {
+    const d = sectionMap.get(sec);
+    const prod = d?.production ?? 0;
+    const total = d?.totalCount ?? 0;
+    const risk  = d?.highRiskCount ?? 0;
+    console.log(
+      `  ${sec}: ${toManYen(prod)} 万円` +
+      `  （件数: ${total}, 高リスク: ${risk}）`
+    );
+  }
+  console.log(`  総生産金額: ${totalAmountLabel} 万円`);
+  console.log("────────────────────────────────────────────\n");
+
   // ── 行 HTML 生成 ──
   const deptRows = SECTIONS.map((sec) => {
-    const d = sectionMap.get(sec) ?? {
-      allocation: 0,
-      highRiskCount: 0,
-      totalCount: 0,
-    };
+    const d = sectionMap.get(sec) ?? { production: 0, highRiskCount: 0, totalCount: 0 };
     return buildDeptRow({
-      section: sec,
-      allocation: d.allocation,
-      lastAllocation: lastWeekMap[sec] ?? 0,
+      section:       sec,
+      production:    d.production,
+      lastProduction: lastWeekMap[sec] ?? 0,
       highRiskCount: d.highRiskCount,
-      totalCount: d.totalCount,
+      totalCount:    d.totalCount,
     });
   }).join("\n");
 
@@ -455,10 +567,10 @@ async function main() {
   let html = await readFile(templatePath, "utf-8");
 
   html = html
-    .replace("{{DATE}}", dateLabel)
-    .replace("{{TOTAL_AMOUNT}}", totalAmountLabel)
+    .replace("{{DATE}}",          dateLabel)
+    .replace("{{TOTAL_AMOUNT}}",  totalAmountLabel)
     .replace("{{HIGH_RISK_DEPT}}", highRiskDeptLabel)
-    .replace("{{DEPT_ROWS}}", deptRows);
+    .replace("{{DEPT_ROWS}}",     deptRows);
 
   const distDir = join(ROOT, "dist");
   await mkdir(distDir, { recursive: true });
@@ -473,15 +585,19 @@ async function main() {
   await takeScreenshot(reportHtmlPath, reportPngPath);
   console.log(`スクリーンショットを保存しました: ${reportPngPath}`);
 
-  // ── Teams 通知送信 ──
-  const imageUrl = `${PAGES_BASE_URL}/report-latest.png`;
-  console.log(`Teams に通知を送信しています... (画像URL: ${imageUrl})`);
+  // ── Teams メッセージ投稿 ──
+  console.log("Teams にメッセージを投稿しています...");
+  const imageBuffer = await readFile(reportPngPath);
 
-  await sendTeamsNotification({
-    webhookUrl: TEAMS_WEBHOOK_URL,
+  await sendTeamsMessage({
+    tenantId:     AZURE_TENANT_ID,
+    clientId:     AZURE_CLIENT_ID,
+    clientSecret: AZURE_CLIENT_SECRET,
+    teamId:       TEAMS_TEAM_ID,
+    channelId:    TEAMS_CHANNEL_ID,
     dateLabel,
-    imageUrl,
-    totalAmount: totalAmountLabel,
+    imageBuffer,
+    totalAmount:  totalAmountLabel,
     highRiskDept: highRiskDeptLabel,
   });
 
