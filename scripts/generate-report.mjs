@@ -5,12 +5,13 @@
  *
  * 処理の流れ:
  *   1. overall-project-schedule の REST API からプロジェクト（受注金額・担当課）を取得
- *   2. PROGRESS_BASHBOARD Neon DB から進捗率を取得
+ *   2. PROGRESS_BASHBOARD Neon DB から weeklyProgress（末尾から最大3つの非 null 値）を取得
  *   3. overall.number === progress.id（業務番号）でジョインし、
- *      生産金額 = allocationSectionN × currentProgress / 100 を課ごとに集計
- *   4. index.html テンプレートにデータを埋め込んで dist/report.html を生成
- *   5. Playwright でスクリーンショット → dist/report-latest.png
- *   6. Teams Incoming Webhook に Adaptive Card を送信
+ *      今週生産 = allocation × (現在% - 前回%) / 100、先週分 = allocation × (前回% - その前%) / 100（増加・減少どちらも反映）を課ごとに集計
+ *   4. calculateRisk で案件ごとにリスク評価し、課別に highRiskCount / cautionCount を集計
+ *   5. index.html テンプレートにデータを埋め込んで dist/report.html を生成
+ *   6. Playwright でスクリーンショット → dist/report-latest.png
+ *   7. Teams Incoming Webhook に Adaptive Card を送信
  *
  * 必要な環境変数:
  *   OVERALL_PROJECT_SCHEDULE_URL - overall-project-schedule アプリの URL
@@ -23,7 +24,8 @@
  * overall-project-schedule API レスポンス（GET /api/projects-data）:
  *   { projects: [ { id, number, name, status, contractAmount,
  *                   allocationSection1, allocationSection2, allocationSection3,
- *                   responsibleSections, revisedEndDate, endDate, ... } ] }
+ *                   responsibleSections, revisedEndDate, endDate,
+ *                   startDate, originalStartDate, outsourcingAmount, ... } ] }
  *
  * PROGRESS_BASHBOARD の app_data スキーマ:
  *   app_data テーブル, key = 'projects', value は JSONB 配列。
@@ -43,11 +45,11 @@ const ROOT = join(__dirname, "..");
 // 定数
 // ──────────────────────────────────────────────
 
-/** 納期まで何日以内を「高リスク」とみなすか */
-const HIGH_RISK_DAYS = 14;
-
 /** 集計対象の担当課リスト */
 const SECTIONS = ["1課", "2課", "3課"];
+
+/** Max risk-detail rows to log (console) */
+const TOP_RISK_LOG_LIMIT = 10;
 
 // ──────────────────────────────────────────────
 // DB クエリ
@@ -79,18 +81,40 @@ async function fetchAllProjects(baseUrl) {
 }
 
 /**
- * PROGRESS_BASHBOARD DB から業務番号ごとの現在進捗率（0〜100）マップを取得する。
- *
- * スキーマ想定:
- *   { id: "46-003", name: "...", weeklyProgress: [null, 30, 60, null, 75, ...] }
- *
- * `id` が OVERALL_PROJECT_SCHEDULE の `number`（業務番号）と対応する結合キー。
- * 現在進捗は weeklyProgress の末尾から遡って最初の非 null 値を使用する。
- *
- * @param {import("@neondatabase/serverless").NeonQueryFunction} sql
- * @returns {Promise<Map<string, number>>} 業務番号 → 現在進捗率（0〜100）
+ * @param {unknown} v
+ * @returns {number}
  */
-async function fetchProgressRates(sql) {
+function clampProgressPercent(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(100, Math.max(0, n));
+}
+
+/**
+ * weeklyProgress 末尾側から最大3つの非 null 値（現在・1つ前・2つ前）。
+ * 欠けたスロットは current/previous は 0、beforePrevious は null（その場合は先週の差分を 0 とみなします）。
+ * @param {unknown} weeklyProgress
+ * @returns {{ current: number; previous: number; beforePrevious: number | null }}
+ */
+function lastThreeWeeklyProgressValues(weeklyProgress) {
+  const arr = Array.isArray(weeklyProgress) ? weeklyProgress : [];
+  const found = [];
+  for (let i = arr.length - 1; i >= 0 && found.length < 3; i--) {
+    const v = arr[i];
+    if (v != null && v !== "") found.push(clampProgressPercent(v));
+  }
+  return {
+    current: found[0] ?? 0,
+    previous: found[1] ?? 0,
+    beforePrevious: found.length >= 3 ? found[2] : null,
+  };
+}
+
+/**
+ * @param {import("@neondatabase/serverless").NeonQueryFunction} sql
+ * @returns {Promise<Map<string, { current: number; previous: number; beforePrevious: number | null }>>}
+ */
+async function fetchProgressData(sql) {
   const rows = await sql`
     SELECT p AS project
     FROM   app_data,
@@ -101,47 +125,184 @@ async function fetchProgressRates(sql) {
   const map = new Map();
   for (const { project } of rows) {
     if (project.id == null) continue;
-    const weeklyProgress = Array.isArray(project.weeklyProgress)
-      ? project.weeklyProgress
-      : [];
-    const currentProgress =
-      [...weeklyProgress].reverse().find((v) => v != null) ?? 0;
-    map.set(String(project.id), Number(currentProgress));
+    const { current, previous, beforePrevious } = lastThreeWeeklyProgressValues(
+      project.weeklyProgress
+    );
+    map.set(String(project.id), { current, previous, beforePrevious });
   }
   return map;
 }
+
+// ──────────────────────────────────────────────
+// Risk scoring
+// ──────────────────────────────────────────────
+
+/**
+ * @param {string | null | undefined} raw
+ * @returns {Date | null}
+ */
+function parseProjectDate(raw) {
+  if (raw == null || raw === "") return null;
+  const s = typeof raw === "string" ? raw : String(raw);
+  const x = new Date(s);
+  if (Number.isNaN(x.getTime())) return null;
+  x.setHours(0, 0, 0, 0);
+  return x;
+}
+
+/**
+ * @param {Date} a
+ * @param {Date} b
+ */
+function dayDiffFloor(a, b) {
+  return Math.floor((a.getTime() - b.getTime()) / 86400000);
+}
+
+/**
+ * @param {Object} project
+ * @param {Date} today
+ */
+function buildScheduleInputsForRisk(project, today) {
+  const startRaw = project.originalStartDate ?? project.startDate;
+  const endRaw = project.revisedEndDate ?? project.endDate ?? null;
+
+  const start = parseProjectDate(
+    startRaw == null || startRaw === "" ? null : String(startRaw)
+  );
+  const end = parseProjectDate(
+    endRaw == null || endRaw === "" ? null : String(endRaw)
+  );
+
+  const elapsedDays = start ? Math.max(0, dayDiffFloor(today, start)) : 0;
+
+  let totalDays = 1;
+  if (start && end) {
+    totalDays = Math.max(1, dayDiffFloor(end, start));
+  } else if (start && !end) {
+    totalDays = Math.max(1, elapsedDays + 1);
+  }
+
+  const remainingDays = end ? dayDiffFloor(end, today) : 99999;
+
+  const contractAmount = Number(project.contractAmount ?? 0);
+  const outsourceCost = Number(
+    project.outsourcingAmount ?? project.outsourceCost ?? 0
+  );
+
+  return {
+    elapsedDays,
+    totalDays,
+    remainingDays,
+    contractAmount,
+    outsourceCost,
+  };
+}
+
+function calculateRisk({
+  progress,
+  elapsedDays,
+  totalDays,
+  remainingDays,
+  outsourceCost,
+  contractAmount,
+}) {
+  const progressClamped = clampProgressPercent(progress);
+  const elapsed = Math.max(0, Number(elapsedDays) || 0);
+  const total = Math.max(1, Number(totalDays) || 1);
+  const remainingRaw = Number(remainingDays);
+  const remaining = Number.isFinite(remainingRaw) ? remainingRaw : 99999;
+
+  let riskScore = 0;
+  const riskFactors = [];
+
+  const expectedProgress = (elapsed / total) * 100;
+  const remainingWork = 100 - progressClamped;
+  const requiredSpeed = remainingWork / Math.max(remaining, 1);
+  const denom = Math.max(Number(contractAmount) || 0, 1);
+  const outsourceRate = (Number(outsourceCost) || 0) / denom;
+
+  if (progressClamped < expectedProgress - 10) {
+    riskScore += 2;
+    riskFactors.push("工期に対して進捗が遅れている");
+  }
+
+  if (remaining < 7 && progressClamped < 80) {
+    riskScore += 2;
+    riskFactors.push("残り期間が短く、進捗が不足している");
+  }
+
+  if (requiredSpeed > 5) {
+    riskScore += 2;
+    riskFactors.push(`必要進捗スピードが高い（${requiredSpeed.toFixed(1)}%/日）`);
+  } else if (requiredSpeed > 3) {
+    riskScore += 1;
+    riskFactors.push(`進捗スピードに注意（${requiredSpeed.toFixed(1)}%/日）`);
+  }
+
+  if (outsourceRate > 0.6) {
+    if (progressClamped < 70) {
+      riskScore -= 1;
+      riskFactors.push("外注活用により進捗加速中");
+    } else {
+      riskScore += 2;
+      riskFactors.push("終盤で外注依存が高い");
+    }
+  }
+
+  riskScore = Math.max(riskScore, 0);
+
+  let riskLevel = "";
+  let riskColor = "";
+
+  if (riskScore >= 4) {
+    riskLevel = "高リスク";
+    riskColor = "red";
+  } else if (riskScore >= 2) {
+    riskLevel = "注意";
+    riskColor = "yellow";
+  } else {
+    riskLevel = "順調";
+    riskColor = "green";
+  }
+
+  return {
+    riskScore,
+    riskLevel,
+    riskColor,
+    expectedProgress,
+    requiredSpeed,
+    outsourceRate,
+    riskFactors,
+  };
+}
+
 
 // ──────────────────────────────────────────────
 // 生産金額の集計（JS ジョイン）
 // ──────────────────────────────────────────────
 
 /**
- * overall.number === progress.id でジョインし、課ごとの生産金額を集計する。
+ * overall.number === progress.id でジョインし、課ごとに生産金額を集計。
+ * 今週生産 = allocationSectionN × (現在% - 前回%) / 100（差分はマイナスもそのまま）
+ * highRiskCount / cautionCount は calculateRisk のレベルで集計。
  *
- * 生産金額の計算:
- *   section1Production = allocationSection1 * currentProgress / 100
- *   section2Production = allocationSection2 * currentProgress / 100
- *   section3Production = allocationSection3 * currentProgress / 100
- *
- * totalCount / highRiskCount は responsibleSections を使って課ごとにカウントする。
- *
- * @param {Object[]} projects       OVERALL_PROJECT_SCHEDULE から取得した全プロジェクト
- * @param {Map<string, number>} progressMap  業務番号 → 現在進捗率（0〜100）
- * @returns {{
- *   sectionMap: Map<string, {production: number; highRiskCount: number; totalCount: number}>;
- *   matchedCount: number;
- *   unmatchedOverallCount: number;
- *   unmatchedProgressCount: number;
- * }}
+ * @param {Object[]} projects
+ * @param {Map<string, { current: number; previous: number; beforePrevious: number | null }>} progressDataMap
  */
-function computeSectionStats(projects, progressMap) {
+function computeSectionStats(projects, progressDataMap) {
   const sectionMap = new Map(
-    SECTIONS.map((sec) => [sec, { production: 0, highRiskCount: 0, totalCount: 0 }])
+    SECTIONS.map((sec) => [
+      sec,
+      { production: 0, highRiskCount: 0, cautionCount: 0, totalCount: 0 },
+    ])
   );
 
   let matchedCount = 0;
   let unmatchedOverallCount = 0;
   const matchedProgressIds = new Set();
+
+  /** @type {{ businessNumber: string; name: string; riskScore: number; riskLevel: string; riskFactors: string[] }[]} */
+  const riskLogEntries = [];
 
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -149,35 +310,59 @@ function computeSectionStats(projects, progressMap) {
   for (const project of projects) {
     if (["完納", "仮納品"].includes(project.status)) continue;
 
-    // 結合キー: overall.number === progress.id（業務番号）
     const businessNumber = String(project.number ?? "");
-    const currentProgress = progressMap.get(businessNumber); // 0〜100 or undefined
+    const pair = progressDataMap.get(businessNumber);
 
-    if (currentProgress == null) {
+    if (pair == null) {
       unmatchedOverallCount++;
     } else {
       matchedCount++;
       matchedProgressIds.add(businessNumber);
     }
 
-    const effectivePct = currentProgress ?? 0; // 未マッチは進捗 0% 扱い
+    const currentProgress = pair?.current ?? 0;
+    const previousProgress = pair?.previous ?? 0;
+    const deltaPct = currentProgress - previousProgress;
 
-    // 各課の生産金額 = 配分額 × 進捗率 / 100
     const alloc1 = Number(project.allocationSection1 ?? 0);
     const alloc2 = Number(project.allocationSection2 ?? 0);
     const alloc3 = Number(project.allocationSection3 ?? 0);
-    sectionMap.get("1課").production += Math.floor(alloc1 * effectivePct / 100);
-    sectionMap.get("2課").production += Math.floor(alloc2 * effectivePct / 100);
-    sectionMap.get("3課").production += Math.floor(alloc3 * effectivePct / 100);
+    sectionMap.get("1課").production += Math.floor((alloc1 * deltaPct) / 100);
+    sectionMap.get("2課").production += Math.floor((alloc2 * deltaPct) / 100);
+    sectionMap.get("3課").production += Math.floor((alloc3 * deltaPct) / 100);
 
-    // 高リスク判定（納期まで HIGH_RISK_DAYS 日以内かつ「進行中」）
-    const rawEndDate = project.revisedEndDate ?? project.endDate ?? null;
-    const isHighRisk =
-      project.status === "進行中" &&
-      rawEndDate != null &&
-      (new Date(rawEndDate) - today) / 86400000 <= HIGH_RISK_DAYS;
+    let riskResult = null;
+    try {
+      const sched = buildScheduleInputsForRisk(project, today);
+      riskResult = calculateRisk({
+        progress: currentProgress,
+        elapsedDays: sched.elapsedDays,
+        totalDays: sched.totalDays,
+        remainingDays: sched.remainingDays,
+        outsourceCost: sched.outsourceCost,
+        contractAmount: sched.contractAmount,
+      });
+    } catch {
+      riskResult = calculateRisk({
+        progress: currentProgress,
+        elapsedDays: 0,
+        totalDays: 1,
+        remainingDays: 99999,
+        outsourceCost: 0,
+        contractAmount: 0,
+      });
+    }
 
-    // totalCount / highRiskCount は responsibleSections 単位でカウント
+    if (riskResult) {
+      riskLogEntries.push({
+        businessNumber,
+        name: String(project.name ?? ""),
+        riskScore: riskResult.riskScore,
+        riskLevel: riskResult.riskLevel,
+        riskFactors: [...riskResult.riskFactors],
+      });
+    }
+
     const sections = Array.isArray(project.responsibleSections)
       ? project.responsibleSections
       : [];
@@ -185,56 +370,53 @@ function computeSectionStats(projects, progressMap) {
       if (!sectionMap.has(sec)) continue;
       const d = sectionMap.get(sec);
       d.totalCount++;
-      if (isHighRisk) d.highRiskCount++;
+      if (riskResult?.riskLevel === "高リスク") d.highRiskCount++;
+      else if (riskResult?.riskLevel === "注意") d.cautionCount++;
     }
   }
 
-  // progressMap のうち overall と結合できなかった件数
-  const unmatchedProgressCount = [...progressMap.keys()].filter(
+  const unmatchedProgressCount = [...progressDataMap.keys()].filter(
     (id) => !matchedProgressIds.has(id)
   ).length;
 
-  return { sectionMap, matchedCount, unmatchedOverallCount, unmatchedProgressCount };
+  return {
+    sectionMap,
+    matchedCount,
+    unmatchedOverallCount,
+    unmatchedProgressCount,
+    riskLogEntries,
+  };
 }
-
 /**
- * 先週（CURRENT_DATE-14 〜 CURRENT_DATE-7）に完納／仮納品になった
- * プロジェクトの課ごと生産金額合計を返す（先週比の計算に使用）。
- *
- * 結合キー: overall.number === progress.id（業務番号）
- * 完納案件は進捗率マップにあればその値を使い、なければ 100% とみなす。
+ * 先週の進捗差分 × 配分で課ごとに集計する（先週比の分母用）。
+ * lastWeekDelta = previousProgress - beforePreviousProgress。
+ * beforePrevious が無い案件は lastWeekDelta を 0 とする。
+ * 対象案件・結合キーは computeSectionStats と同じ（完納・仮納品は除外）。
  *
  * @param {Object[]} projects
- * @param {Map<string, number>} progressMap  業務番号 → 現在進捗率（0〜100）
- * @returns {Record<string, number>} section → 先週の生産金額合計（円）
+ * @param {Map<string, { current: number; previous: number; beforePrevious: number | null }>} progressDataMap
+ * @returns {Record<string, number>} section → 先週分の生産金額合計（円）
  */
-function computeLastWeekProduction(projects, progressMap) {
-  const map = {};
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const sevenDaysAgo    = new Date(today); sevenDaysAgo.setDate(today.getDate() - 7);
-  const fourteenDaysAgo = new Date(today); fourteenDaysAgo.setDate(today.getDate() - 14);
+function computeLastWeekProduction(projects, progressDataMap) {
+  const map = { "1課": 0, "2課": 0, "3課": 0 };
 
   for (const project of projects) {
-    if (!["完納", "仮納品"].includes(project.status)) continue;
+    if (["完納", "仮納品"].includes(project.status)) continue;
 
-    const rawEndDate = project.revisedEndDate ?? project.endDate ?? null;
-    if (rawEndDate == null) continue;
-
-    const endDate = new Date(rawEndDate);
-    if (endDate < fourteenDaysAgo || endDate > sevenDaysAgo) continue;
-
-    // 結合キー: overall.number === progress.id（業務番号）
     const businessNumber = String(project.number ?? "");
-    const pct = progressMap.get(businessNumber) ?? 100; // 完納はデフォルト 100%
+    const pair = progressDataMap.get(businessNumber);
+    const lastWeekDelta =
+      pair != null && pair.beforePrevious != null
+        ? pair.previous - pair.beforePrevious
+        : 0;
 
     const alloc1 = Number(project.allocationSection1 ?? 0);
     const alloc2 = Number(project.allocationSection2 ?? 0);
     const alloc3 = Number(project.allocationSection3 ?? 0);
 
-    map["1課"] = (map["1課"] ?? 0) + Math.floor(alloc1 * pct / 100);
-    map["2課"] = (map["2課"] ?? 0) + Math.floor(alloc2 * pct / 100);
-    map["3課"] = (map["3課"] ?? 0) + Math.floor(alloc3 * pct / 100);
+    map["1課"] += Math.floor((alloc1 * lastWeekDelta) / 100);
+    map["2課"] += Math.floor((alloc2 * lastWeekDelta) / 100);
+    map["3課"] += Math.floor((alloc3 * lastWeekDelta) / 100);
   }
 
   return map;
@@ -260,6 +442,9 @@ function toManYen(yen) {
  * @returns {{ arrow: string; colorClass: string; label: string }}
  */
 function weekOverWeekDisplay(current, last) {
+  if (last === 0 && current === 0) {
+    return { arrow: "→", colorClass: "text-slate-400", label: "先週比 ±0%" };
+  }
   if (last === 0) {
     return { arrow: "－", colorClass: "text-slate-400", label: "先週比 N/A" };
   }
@@ -289,26 +474,48 @@ function weekOverWeekDisplay(current, last) {
  *   production: number;
  *   lastProduction: number;
  *   highRiskCount: number;
+ *   cautionCount: number;
  *   totalCount: number;
  * }} stat
  * @returns {string}
  */
 function buildDeptRow(stat) {
-  const { section, production, lastProduction, highRiskCount, totalCount } = stat;
+  const {
+    section,
+    production,
+    lastProduction,
+    highRiskCount,
+    cautionCount,
+    totalCount,
+  } = stat;
 
+  const c = cautionCount ?? 0;
   const isHigh = highRiskCount > 0;
-  const riskLevel   = isHigh ? "high" : "low";
-  const riskBg      = isHigh ? "bg-red-50/60"              : "bg-blue-50/60";
-  const badgeColor  = isHigh ? "bg-red-100 text-red-700"   : "bg-blue-100 text-blue-700";
-  const dotColor    = isHigh ? "bg-red-500"                 : "bg-blue-500";
-  const statusLabel = isHigh ? "危険"                       : "安全";
-  const ariaLabel   = `高リスク業務: ${statusLabel}（${totalCount}件中${highRiskCount}件）`;
+  const isCautionOnly = !isHigh && c > 0;
+  const dataRisk = isHigh ? "high" : isCautionOnly ? "medium" : "low";
+  const riskBg = isHigh
+    ? "bg-red-50/60"
+    : isCautionOnly
+      ? "bg-amber-50/60"
+      : "bg-blue-50/60";
+  const badgeColor = isHigh
+    ? "bg-red-100 text-red-700"
+    : isCautionOnly
+      ? "bg-amber-100 text-amber-800"
+      : "bg-blue-100 text-blue-700";
+  const dotColor = isHigh
+    ? "bg-red-500"
+    : isCautionOnly
+      ? "bg-amber-500"
+      : "bg-blue-500";
+  const statusLabel = isHigh ? "要警戒" : isCautionOnly ? "注意あり" : "順調";
+  const ariaLabel = `リスク: 高リスク${highRiskCount}件、注意${c}件、全${totalCount}件`;
 
   const { arrow, colorClass, label } = weekOverWeekDisplay(production, lastProduction);
   const amountManYen = toManYen(production);
 
   return `
-            <tr data-risk-level="${riskLevel}" class="transition-colors hover:bg-slate-50/50">
+            <tr data-risk-level="${dataRisk}" class="transition-colors hover:bg-slate-50/50">
               <th scope="row" class="px-4 py-4 text-sm sm:text-base font-semibold text-slate-700">
                 ${section}
               </th>
@@ -325,8 +532,15 @@ function buildDeptRow(stat) {
                 aria-label="${ariaLabel}"
               >
                 <div class="flex flex-col items-center gap-2">
-                  <span class="text-sm sm:text-base font-bold text-slate-700">
-                    <span class="text-xl sm:text-2xl">${highRiskCount}</span> 件／${totalCount} 件中
+                  <span class="text-sm sm:text-base font-bold text-slate-700 leading-tight">
+                    <span class="text-lg sm:text-xl text-red-600">${highRiskCount}</span>
+                    <span class="text-slate-400 font-normal"> 高</span>
+                    <span class="mx-1 text-slate-300">/</span>
+                    <span class="text-lg sm:text-xl text-amber-600">${c}</span>
+                    <span class="text-slate-400 font-normal"> 注</span>
+                    <span class="mx-1 text-slate-300">/</span>
+                    <span class="text-lg sm:text-xl">${totalCount}</span>
+                    <span class="text-slate-400 font-normal"> 計</span>
                   </span>
                   <span class="inline-flex items-center gap-1.5 rounded-full ${badgeColor} px-3 py-1 text-xs sm:text-sm font-semibold">
                     <span class="w-1.5 h-1.5 rounded-full ${dotColor} flex-shrink-0" aria-hidden="true"></span>
@@ -381,10 +595,18 @@ async function takeScreenshot(htmlPath, outputPath) {
  *   imageUrl: string;
  *   totalAmount: string;
  *   highRiskDept: string;
+ *   cautionDept: string;
  * }} opts
  */
 async function sendTeamsNotification(opts) {
-  const { webhookUrl, dateLabel, imageUrl, totalAmount, highRiskDept } = opts;
+  const {
+    webhookUrl,
+    dateLabel,
+    imageUrl,
+    totalAmount,
+    highRiskDept,
+    cautionDept,
+  } = opts;
 
   const payload = {
     type: "message",
@@ -409,6 +631,7 @@ async function sendTeamsNotification(opts) {
               facts: [
                 { title: "合計生産額", value: `${totalAmount} 万円` },
                 { title: "高リスク該当", value: highRiskDept || "なし" },
+                { title: "注意該当", value: cautionDept || "なし" },
               ],
             },
             {
@@ -450,6 +673,22 @@ async function sendTeamsNotification(opts) {
 // メイン処理
 // ──────────────────────────────────────────────
 
+function logTopRisks(riskLogEntries) {
+  const sorted = [...riskLogEntries].sort((a, b) => b.riskScore - a.riskScore);
+  const top = sorted.slice(0, TOP_RISK_LOG_LIMIT);
+  if (top.length === 0) return;
+  console.log("\n─── リスクスコア上位案件（参考） ───────────────────");
+  for (const e of top) {
+    console.log(
+      `  [${e.businessNumber}] ${e.name}  score=${e.riskScore}  ${e.riskLevel}`
+    );
+    if (e.riskFactors.length > 0) {
+      console.log(`    要因: ${e.riskFactors.join(" / ")}`);
+    }
+  }
+  console.log("────────────────────────────────────────────\n");
+}
+
 async function main() {
   // ── 環境変数チェック ──
   const OVERALL_PROJECT_SCHEDULE_URL = process.env.OVERALL_PROJECT_SCHEDULE_URL;
@@ -482,18 +721,25 @@ async function main() {
   // ── 両ソースから並列取得 ──
   console.log("データを取得しています...");
   console.log(`  overall-project-schedule API: ${OVERALL_PROJECT_SCHEDULE_URL}`);
-  const [allProjects, progressMap] = await Promise.all([
+  const [allProjects, progressDataMap] = await Promise.all([
     fetchAllProjects(OVERALL_PROJECT_SCHEDULE_URL),
-    fetchProgressRates(sqlProgress),
+    fetchProgressData(sqlProgress),
   ]);
 
   console.log(`  overall 案件数: ${allProjects.length} 件`);
-  console.log(`  progress 案件数: ${progressMap.size} 件`);
+  console.log(`  progress 案件数: ${progressDataMap.size} 件`);
 
   // ── JS 側でジョイン → 生産金額を集計 ──
   // 結合キー: overall.number === progress.id（業務番号）
-  const { sectionMap, matchedCount, unmatchedOverallCount, unmatchedProgressCount } =
-    computeSectionStats(allProjects, progressMap);
+  const {
+    sectionMap,
+    matchedCount,
+    unmatchedOverallCount,
+    unmatchedProgressCount,
+    riskLogEntries,
+  } = computeSectionStats(allProjects, progressDataMap);
+
+  logTopRisks(riskLogEntries);
 
   console.log(`  結合できた件数:                  ${matchedCount} 件`);
   console.log(`  結合できなかった overall 案件数: ${unmatchedOverallCount} 件（進捗率 0% 扱い）`);
@@ -505,23 +751,27 @@ async function main() {
     );
   }
 
-  // ── 先週の生産金額（先週比用） ──
-  const lastWeekMap = computeLastWeekProduction(allProjects, progressMap);
+  // ── 先週の進捗差分ベース生産金額（先週比の分母） ──
+  const lastWeekMap = computeLastWeekProduction(allProjects, progressDataMap);
 
   // ── サマリー集計 ──
   let totalProductionYen = 0;
   const highRiskSections = [];
+  const cautionSections = [];
 
   for (const sec of SECTIONS) {
     const d = sectionMap.get(sec);
     if (!d) continue;
     totalProductionYen += d.production;
     if (d.highRiskCount > 0) highRiskSections.push(sec);
+    if (d.cautionCount > 0) cautionSections.push(sec);
   }
 
   const totalAmountLabel  = toManYen(totalProductionYen);
   const highRiskDeptLabel =
     highRiskSections.length > 0 ? highRiskSections.join("・") : "なし";
+  const cautionDeptLabel =
+    cautionSections.length > 0 ? cautionSections.join("・") : "なし";
 
   // ── 課ごとの生産金額をコンソールに出力 ──
   console.log("\n─── 課ごとの合計生産金額 ───────────────────");
@@ -529,10 +779,11 @@ async function main() {
     const d = sectionMap.get(sec);
     const prod = d?.production ?? 0;
     const total = d?.totalCount ?? 0;
-    const risk  = d?.highRiskCount ?? 0;
+    const hi = d?.highRiskCount ?? 0;
+    const ca = d?.cautionCount ?? 0;
     console.log(
       `  ${sec}: ${toManYen(prod)} 万円` +
-      `  （件数: ${total}, 高リスク: ${risk}）`
+      `  （件数: ${total}, 高リスク: ${hi}, 注意: ${ca}）`
     );
   }
   console.log(`  総生産金額: ${totalAmountLabel} 万円`);
@@ -540,13 +791,19 @@ async function main() {
 
   // ── 行 HTML 生成 ──
   const deptRows = SECTIONS.map((sec) => {
-    const d = sectionMap.get(sec) ?? { production: 0, highRiskCount: 0, totalCount: 0 };
+    const d = sectionMap.get(sec) ?? {
+      production: 0,
+      highRiskCount: 0,
+      cautionCount: 0,
+      totalCount: 0,
+    };
     return buildDeptRow({
-      section:       sec,
-      production:    d.production,
+      section:        sec,
+      production:     d.production,
       lastProduction: lastWeekMap[sec] ?? 0,
-      highRiskCount: d.highRiskCount,
-      totalCount:    d.totalCount,
+      highRiskCount:  d.highRiskCount,
+      cautionCount:   d.cautionCount,
+      totalCount:     d.totalCount,
     });
   }).join("\n");
 
@@ -559,6 +816,7 @@ async function main() {
     .replace("{{DATE}}",          dateLabel)
     .replace("{{TOTAL_AMOUNT}}",  totalAmountLabel)
     .replace("{{HIGH_RISK_DEPT}}", highRiskDeptLabel)
+    .replace("{{CAUTION_DEPT}}",   cautionDeptLabel)
     .replace("{{DEPT_ROWS}}",     deptRows);
 
   const distDir = join(ROOT, "dist");
@@ -584,6 +842,7 @@ async function main() {
     imageUrl,
     totalAmount:  totalAmountLabel,
     highRiskDept: highRiskDeptLabel,
+    cautionDept:  cautionDeptLabel,
   });
 
   console.log("完了しました。");

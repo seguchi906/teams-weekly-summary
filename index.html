@@ -46,6 +46,10 @@
           <span class="w-2 h-2 rounded-full bg-red-500 flex-shrink-0" aria-hidden="true"></span>
           <span class="font-semibold text-red-600">高リスク該当：{{HIGH_RISK_DEPT}}</span>
         </div>
+        <div class="flex items-center gap-1.5">
+          <span class="w-2 h-2 rounded-full bg-amber-500 flex-shrink-0" aria-hidden="true"></span>
+          <span class="font-semibold text-amber-700">注意該当：{{CAUTION_DEPT}}</span>
+        </div>
       </div>
 
       <!-- テーブル -->
@@ -65,7 +69,7 @@
                 生産額
               </th>
               <th scope="col" class="px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                高リスク業務
+                リスク（高／注意）
               </th>
             </tr>
           </thead>
@@ -78,8 +82,9 @@
 
       <!-- 凡例・補足 -->
       <div class="px-5 py-4 bg-slate-50 border-t border-slate-100 text-xs text-slate-400 space-y-1">
-        <p>※ 高リスク業務とは、納期まで14日以内かつ進行中の業務です。</p>
-        <p>※ 生産額は各課の配分額合計（税抜・万円単位）です。</p>
+        <p>※ リスクは進捗遅れ・残期間・必要ペース・外注依存などからスコア化しています（高リスク／注意／順調）。</p>
+        <p>※ 生産額は各課の配分額×週次の進捗率の差分（税抜・万円表示・切り捨て）。進捗の戻りは差分がマイナスとして反映されます。</p>
+        <p>※ 表内の先週比は、課ごとの「今週の差分ベース生産」と「先週の差分ベース生産」の比率です。</p>
       </div>
 
     </div>
