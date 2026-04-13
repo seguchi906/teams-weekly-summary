@@ -24,7 +24,7 @@
  * overall-project-schedule API レスポンス（GET /api/projects-data）:
  *   { projects: [ { id, number, name, status, contractAmount,
  *                   allocationSection1, allocationSection2, allocationSection3,
- *                   responsibleSections, revisedEndDate, endDate,
+ *                   responsibleSections, responsibleDept, revisedEndDate, endDate,
  *                   startDate, originalStartDate, outsourcingAmount, ... } ] }
  *
  * PROGRESS_BASHBOARD の app_data スキーマ:
@@ -115,6 +115,52 @@ function clampProgressPercent(v) {
 }
 
 /**
+ * ダッシュボード / Overall Project Schedule の「進行中」フィルタと同じ定義。
+ * weeklyProgress に非 null が1つも無ければ null（進捗率未記録）。
+ *
+ * @param {unknown} weeklyProgress
+ * @returns {number | null} 0〜100、未記録は null
+ */
+function getCurrentProgressFromWeekly(weeklyProgress) {
+  const arr = Array.isArray(weeklyProgress) ? weeklyProgress : [];
+  const valid = arr.filter((v) => v !== null);
+  if (!valid.length) return null;
+  return clampProgressPercent(valid[valid.length - 1]);
+}
+
+/**
+ * @param {string} s
+ * @returns {boolean}
+ */
+function isResponsibleSection(s) {
+  return SECTIONS.includes(s);
+}
+
+/**
+ * Overall Project Schedule の getResponsibleSections と同じ（担当課の配列）。
+ *
+ * @param {Object} p
+ * @returns {string[]}
+ */
+function getResponsibleSectionsForProject(p) {
+  const rs = p.responsibleSections;
+  if (Array.isArray(rs) && rs.length > 0) {
+    return SECTIONS.filter((k) => rs.includes(k));
+  }
+  const legacy = p.responsibleDept?.trim();
+  if (!legacy) return [];
+  const found = new Set();
+  for (const k of SECTIONS) {
+    if (legacy.includes(k)) found.add(k);
+  }
+  const parts = legacy.split(/[・,\/\s]+/).map((x) => x.trim()).filter(Boolean);
+  for (const part of parts) {
+    if (isResponsibleSection(part)) found.add(part);
+  }
+  return SECTIONS.filter((k) => found.has(k));
+}
+
+/**
  * weeklyProgress 末尾側から最大3つの非 null 値（現在・1つ前・2つ前）。
  * 欠けたスロットは current/previous は 0、beforePrevious は null（その場合は先週の差分を 0 とみなします）。
  * @param {unknown} weeklyProgress
@@ -136,7 +182,7 @@ function lastThreeWeeklyProgressValues(weeklyProgress) {
 
 /**
  * @param {import("@neondatabase/serverless").NeonQueryFunction} sql
- * @returns {Promise<Map<string, { current: number; previous: number; beforePrevious: number | null }>>}
+ * @returns {Promise<Map<string, { current: number; previous: number; beforePrevious: number | null; recordedProgress: number | null }>>}
  */
 async function fetchProgressData(sql) {
   const rows = await sql`
@@ -152,7 +198,15 @@ async function fetchProgressData(sql) {
     const { current, previous, beforePrevious } = lastThreeWeeklyProgressValues(
       project.weeklyProgress
     );
-    map.set(String(project.id), { current, previous, beforePrevious });
+    const recordedProgress = getCurrentProgressFromWeekly(
+      project.weeklyProgress
+    );
+    map.set(String(project.id), {
+      current,
+      previous,
+      beforePrevious,
+      recordedProgress,
+    });
   }
   return map;
 }
@@ -309,12 +363,14 @@ function calculateRisk({
  * overall.number === progress.id でジョインし、課ごとに生産金額を集計。
  * 今週生産 = allocationSectionN × (現在% - 前回%) / 100（差分はマイナスもそのまま）
  * 現在進捗率が EXCLUDE_FROM_METRICS_PROGRESS_MIN 以上の案件は生産・リスク集計から除外。
- * 生産・リスク・件数の対象案件は status が「進行中」かつ上記を満たすもの。
- * 課別 totalCount / highRiskCount / cautionCount は allocationSectionN > 0 のみ（responsibleSections は使わない）。
+ * 生産・リスク・件数の母集団は Overall Project Schedule の「進行中」と同じ:
+ * ダッシュボードに週次進捗が1件以上記録されており（recordedProgress が non-null）、
+ * かつその値が EXCLUDE_FROM_METRICS_PROGRESS_MIN 未満。status は見ない。
+ * 課別 totalCount / highRiskCount / cautionCount は getResponsibleSectionsForProject（担当課）で振り分け。
  * highRiskCount / cautionCount は calculateRisk のレベルを各課に振り分ける。
  *
  * @param {Object[]} projects
- * @param {Map<string, { current: number; previous: number; beforePrevious: number | null }>} progressDataMap
+ * @param {Map<string, { current: number; previous: number; beforePrevious: number | null; recordedProgress: number | null }>} progressDataMap
  */
 function computeSectionStats(projects, progressDataMap) {
   const sectionMap = new Map(
@@ -335,24 +391,21 @@ function computeSectionStats(projects, progressDataMap) {
   today.setHours(0, 0, 0, 0);
 
   for (const project of projects) {
-    if (["完納", "仮納品"].includes(project.status)) continue;
-
     const businessNumber = String(project.number ?? "");
     const pair = progressDataMap.get(businessNumber);
 
     if (pair == null) {
       unmatchedOverallCount++;
-    } else {
-      matchedCount++;
-      matchedProgressIds.add(businessNumber);
+      continue;
     }
+    matchedCount++;
+    matchedProgressIds.add(businessNumber);
 
-    if (project.status !== "進行中") continue;
+    const rec = pair.recordedProgress;
+    if (rec == null || rec >= EXCLUDE_FROM_METRICS_PROGRESS_MIN) continue;
 
-    const currentProgress = pair?.current ?? 0;
-    if (currentProgress >= EXCLUDE_FROM_METRICS_PROGRESS_MIN) continue;
-
-    const previousProgress = pair?.previous ?? 0;
+    const currentProgress = pair.current;
+    const previousProgress = pair.previous;
     const deltaPct = currentProgress - previousProgress;
 
     const alloc1 = Number(project.allocationSection1 ?? 0);
@@ -366,7 +419,7 @@ function computeSectionStats(projects, progressDataMap) {
     try {
       const sched = buildScheduleInputsForRisk(project, today);
       riskResult = calculateRisk({
-        progress: currentProgress,
+        progress: rec,
         elapsedDays: sched.elapsedDays,
         totalDays: sched.totalDays,
         remainingDays: sched.remainingDays,
@@ -375,7 +428,7 @@ function computeSectionStats(projects, progressDataMap) {
       });
     } catch {
       riskResult = calculateRisk({
-        progress: currentProgress,
+        progress: rec,
         elapsedDays: 0,
         totalDays: 1,
         remainingDays: 99999,
@@ -399,9 +452,11 @@ function computeSectionStats(projects, progressDataMap) {
       if (riskResult?.riskLevel === "高リスク") d.highRiskCount++;
       else if (riskResult?.riskLevel === "注意") d.cautionCount++;
     };
-    if (alloc1 > 0) bumpRiskCounts(sectionMap.get("1課"));
-    if (alloc2 > 0) bumpRiskCounts(sectionMap.get("2課"));
-    if (alloc3 > 0) bumpRiskCounts(sectionMap.get("3課"));
+    const responsibleSecs = getResponsibleSectionsForProject(project);
+    for (const sec of responsibleSecs) {
+      if (!sectionMap.has(sec)) continue;
+      bumpRiskCounts(sectionMap.get(sec));
+    }
   }
 
   const unmatchedProgressCount = [...progressDataMap.keys()].filter(
@@ -420,22 +475,21 @@ function computeSectionStats(projects, progressDataMap) {
  * 先週の進捗差分 × 配分で課ごとに集計する（先週比の分母用）。
  * lastWeekDelta = previousProgress - beforePreviousProgress。
  * beforePrevious が無い案件は lastWeekDelta を 0 とする。
- * 対象案件は computeSectionStats の生産集計と同じ（status が「進行中」、進捗 100% 未満）。
+ * 対象案件は computeSectionStats の生産集計と同じ（recordedProgress が non-null かつ 100% 未満）。
  *
  * @param {Object[]} projects
- * @param {Map<string, { current: number; previous: number; beforePrevious: number | null }>} progressDataMap
+ * @param {Map<string, { current: number; previous: number; beforePrevious: number | null; recordedProgress: number | null }>} progressDataMap
  * @returns {Record<string, number>} section → 先週分の生産金額合計（円）
  */
 function computeLastWeekProduction(projects, progressDataMap) {
   const map = { "1課": 0, "2課": 0, "3課": 0 };
 
   for (const project of projects) {
-    if (project.status !== "進行中") continue;
-
     const businessNumber = String(project.number ?? "");
     const pair = progressDataMap.get(businessNumber);
-    const currentProgress = pair?.current ?? 0;
-    if (currentProgress >= EXCLUDE_FROM_METRICS_PROGRESS_MIN) continue;
+    if (pair == null) continue;
+    const rec = pair.recordedProgress;
+    if (rec == null || rec >= EXCLUDE_FROM_METRICS_PROGRESS_MIN) continue;
 
     const lastWeekDelta =
       pair != null && pair.beforePrevious != null
@@ -774,7 +828,9 @@ async function main() {
   logTopRisks(riskLogEntries);
 
   console.log(`  結合できた件数:                  ${matchedCount} 件`);
-  console.log(`  結合できなかった overall 案件数: ${unmatchedOverallCount} 件（進捗率 0% 扱い）`);
+  console.log(
+    `  結合できなかった overall 案件数: ${unmatchedOverallCount} 件（progress DB に業務番号なし・生産・リスク・件数の対象外）`
+  );
   console.log(`  結合できなかった progress 案件数: ${unmatchedProgressCount} 件`);
 
   if (matchedCount === 0) {
