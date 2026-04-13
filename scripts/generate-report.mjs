@@ -376,7 +376,9 @@ function calculateRisk({
 
   if (progressClamped < expectedProgress - 10) {
     riskScore += 2;
-    riskFactors.push("工期に対して進捗が遅れている");
+    riskFactors.push(
+      `工期に対して進捗が遅れている（実績 ${progressClamped.toFixed(1)}%／期待 ${expectedProgress.toFixed(1)}%）`,
+    );
   }
 
   if (remaining < 7 && progressClamped < 80) {
