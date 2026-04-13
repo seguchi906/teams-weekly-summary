@@ -69,6 +69,12 @@ const SECTIONS = ["1課", "2課", "3課"];
 /** Max risk-detail rows to log (console) */
 const TOP_RISK_LOG_LIMIT = 10;
 
+/**
+ * 現在進捗率（weeklyProgress 末尾の現在値、0〜100）がこの値以上の案件は、
+ * 生産・リスク・先週比の集計から除外する（ステータスが完納前でも 100% なら対象外）。
+ */
+const EXCLUDE_FROM_METRICS_PROGRESS_MIN = 100;
+
 // ──────────────────────────────────────────────
 // DB クエリ
 // ──────────────────────────────────────────────
@@ -302,7 +308,10 @@ function calculateRisk({
 /**
  * overall.number === progress.id でジョインし、課ごとに生産金額を集計。
  * 今週生産 = allocationSectionN × (現在% - 前回%) / 100（差分はマイナスもそのまま）
- * highRiskCount / cautionCount は calculateRisk のレベルで集計。
+ * 現在進捗率が EXCLUDE_FROM_METRICS_PROGRESS_MIN 以上の案件は生産・リスク集計から除外。
+ * 生産・リスク・件数の対象案件は status が「進行中」かつ上記を満たすもの。
+ * 課別 totalCount / highRiskCount / cautionCount は allocationSectionN > 0 のみ（responsibleSections は使わない）。
+ * highRiskCount / cautionCount は calculateRisk のレベルを各課に振り分ける。
  *
  * @param {Object[]} projects
  * @param {Map<string, { current: number; previous: number; beforePrevious: number | null }>} progressDataMap
@@ -338,7 +347,11 @@ function computeSectionStats(projects, progressDataMap) {
       matchedProgressIds.add(businessNumber);
     }
 
+    if (project.status !== "進行中") continue;
+
     const currentProgress = pair?.current ?? 0;
+    if (currentProgress >= EXCLUDE_FROM_METRICS_PROGRESS_MIN) continue;
+
     const previousProgress = pair?.previous ?? 0;
     const deltaPct = currentProgress - previousProgress;
 
@@ -381,16 +394,14 @@ function computeSectionStats(projects, progressDataMap) {
       });
     }
 
-    const sections = Array.isArray(project.responsibleSections)
-      ? project.responsibleSections
-      : [];
-    for (const sec of sections) {
-      if (!sectionMap.has(sec)) continue;
-      const d = sectionMap.get(sec);
+    const bumpRiskCounts = (d) => {
       d.totalCount++;
       if (riskResult?.riskLevel === "高リスク") d.highRiskCount++;
       else if (riskResult?.riskLevel === "注意") d.cautionCount++;
-    }
+    };
+    if (alloc1 > 0) bumpRiskCounts(sectionMap.get("1課"));
+    if (alloc2 > 0) bumpRiskCounts(sectionMap.get("2課"));
+    if (alloc3 > 0) bumpRiskCounts(sectionMap.get("3課"));
   }
 
   const unmatchedProgressCount = [...progressDataMap.keys()].filter(
@@ -409,7 +420,7 @@ function computeSectionStats(projects, progressDataMap) {
  * 先週の進捗差分 × 配分で課ごとに集計する（先週比の分母用）。
  * lastWeekDelta = previousProgress - beforePreviousProgress。
  * beforePrevious が無い案件は lastWeekDelta を 0 とする。
- * 対象案件・結合キーは computeSectionStats と同じ（完納・仮納品は除外）。
+ * 対象案件は computeSectionStats の生産集計と同じ（status が「進行中」、進捗 100% 未満）。
  *
  * @param {Object[]} projects
  * @param {Map<string, { current: number; previous: number; beforePrevious: number | null }>} progressDataMap
@@ -419,10 +430,13 @@ function computeLastWeekProduction(projects, progressDataMap) {
   const map = { "1課": 0, "2課": 0, "3課": 0 };
 
   for (const project of projects) {
-    if (["完納", "仮納品"].includes(project.status)) continue;
+    if (project.status !== "進行中") continue;
 
     const businessNumber = String(project.number ?? "");
     const pair = progressDataMap.get(businessNumber);
+    const currentProgress = pair?.current ?? 0;
+    if (currentProgress >= EXCLUDE_FROM_METRICS_PROGRESS_MIN) continue;
+
     const lastWeekDelta =
       pair != null && pair.beforePrevious != null
         ? pair.previous - pair.beforePrevious
