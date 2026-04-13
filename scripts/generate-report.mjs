@@ -10,7 +10,7 @@
  *      今週生産 = allocation × (現在% - 前回%) / 100、先週分 = allocation × (前回% - その前%) / 100（増加・減少どちらも反映）を課ごとに集計
  *   4. calculateRisk で案件ごとにリスク評価し、課別に highRiskCount / cautionCount を集計
  *   5. index.html テンプレートにデータを埋め込んで dist/report.html を生成
- *   6. Playwright でスクリーンショット → dist/report-latest.png
+ *   6. Playwright でスクリーンショット → dist/report-YYYYMMDD-<ms>.png を保存し、あわせて report-latest.png にも同内容をコピー
  *   7. Teams Incoming Webhook に Adaptive Card を送信
  *
  * 必要な環境変数:
@@ -33,13 +33,31 @@
  */
 
 import { neon } from "@neondatabase/serverless";
-import { mkdir, readFile, writeFile } from "fs/promises";
+import { copyFile, mkdir, readFile, writeFile } from "fs/promises";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { chromium } from "playwright";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
+
+/**
+ * @param {string} base
+ */
+function normalizePagesBaseUrl(base) {
+  return String(base ?? "").replace(/\/+$/, "");
+}
+
+/**
+ * @param {Date} d レポート基準日時（runner のローカルタイムゾーン）
+ * @returns {string} 例: report-20260413-1713012345678.png
+ */
+function buildTimestampedReportPngFileName(d) {
+  const y = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `report-${y}${mo}${day}-${Date.now()}.png`;
+}
 
 // ──────────────────────────────────────────────
 // 定数
@@ -826,14 +844,26 @@ async function main() {
   await writeFile(reportHtmlPath, html, "utf-8");
   console.log(`HTML を生成しました: ${reportHtmlPath}`);
 
-  // ── スクリーンショット ──
+  // ── スクリーンショット（一意ファイル名 + report-latest へミラー） ──
   console.log("スクリーンショットを撮影しています...");
-  const reportPngPath = join(distDir, "report-latest.png");
+  const reportPngFileName = buildTimestampedReportPngFileName(now);
+  const reportPngPath = join(distDir, reportPngFileName);
   await takeScreenshot(reportHtmlPath, reportPngPath);
+  const reportLatestPath = join(distDir, "report-latest.png");
+  await copyFile(reportPngPath, reportLatestPath);
   console.log(`スクリーンショットを保存しました: ${reportPngPath}`);
+  console.log(`report-latest.png にコピーしました: ${reportLatestPath}`);
 
-  // ── Teams 通知送信 ──
-  const imageUrl = `${PAGES_BASE_URL}/report-latest.png`;
+  // ── Teams 通知送信（キャッシュ回避: 一意パス + クエリ） ──
+  const pagesBase = normalizePagesBaseUrl(PAGES_BASE_URL);
+  const cacheBust = Date.now();
+  const imageUrl = `${pagesBase}/${reportPngFileName}?v=${cacheBust}`;
+
+  console.log("reportHtmlPath:", reportHtmlPath);
+  console.log("reportPngPath:", reportPngPath);
+  console.log("imageUrl:", imageUrl);
+  console.log("dateLabel:", dateLabel);
+
   console.log(`Teams に通知を送信しています... (画像URL: ${imageUrl})`);
 
   await sendTeamsNotification({

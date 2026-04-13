@@ -70,7 +70,7 @@ jobs:
 
       # ─────────────────────────────────────────
       # 6. dist フォルダを GitHub Pages アーティファクトとしてアップロード
-      #    → https://seguchi906.github.io/teams-weekly-summary/report-latest.png
+      #    → report-YYYYMMDD-<ms>.png と report-latest.png（Teams はタイムスタンプ PNG + ?v= を使用）
       # ─────────────────────────────────────────
       - name: GitHub Pages アーティファクトをアップロード
         uses: actions/upload-pages-artifact@v3
