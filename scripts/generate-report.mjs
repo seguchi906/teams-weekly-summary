@@ -11,7 +11,7 @@
  *   4. calculateRisk で案件ごとにリスク評価し、課別に highRiskCount / cautionCount を集計
  *   5. index.html テンプレートにデータを埋め込んで dist/report.html を生成
  *   6. Playwright でスクリーンショット → dist/report-YYYYMMDD-<ms>.png を保存し、あわせて report-latest.png にも同内容をコピー
- *   7. Teams Incoming Webhook に Adaptive Card を送信
+ *   7. Teams Incoming Webhook に Adaptive Card を2 回送信（週次サマリー用・リスク該当案件用）
  *
  * 必要な環境変数:
  *   OVERALL_PROJECT_SCHEDULE_URL - overall-project-schedule アプリの URL
@@ -68,6 +68,9 @@ const SECTIONS = ["1課", "2課", "3課"];
 
 /** Max risk-detail rows to log (console) */
 const TOP_RISK_LOG_LIMIT = 10;
+
+/** Max risk-detail rows in the 2nd Teams message (Adaptive Card) */
+const TEAMS_RISK_DIGEST_CARD_LIMIT = 25;
 
 /**
  * 現在進捗率（weeklyProgress 末尾の現在値、0〜100）がこの値以上の案件は、
@@ -755,6 +758,121 @@ async function sendTeamsNotification(opts) {
   console.log("Teams への通知を送信しました。");
 }
 
+/**
+ * 高リスク・注意の案件だけを別メッセージとして同じ Webhook に送信する。
+ *
+ * @param {{
+ *   webhookUrl: string;
+ *   dateLabel: string;
+ *   imageUrl: string;
+ *   riskLogEntries: { businessNumber: string; name: string; riskScore: number; riskLevel: string; riskFactors: string[] }[];
+ * }} opts
+ */
+async function sendTeamsRiskDigest(opts) {
+  const { webhookUrl, dateLabel, imageUrl, riskLogEntries } = opts;
+
+  const flagged = riskLogEntries.filter(
+    (e) => e.riskLevel === "高リスク" || e.riskLevel === "注意"
+  );
+  const sorted = [...flagged].sort((a, b) => b.riskScore - a.riskScore);
+  const shown = sorted.slice(0, TEAMS_RISK_DIGEST_CARD_LIMIT);
+  const omitted = sorted.length - shown.length;
+
+  /** @type {object[]} */
+  const body = [
+    {
+      type: "TextBlock",
+      text: `週次レポート（リスク該当案件）　${dateLabel}`,
+      weight: "Bolder",
+      size: "Medium",
+      wrap: true,
+    },
+  ];
+
+  if (sorted.length === 0) {
+    body.push({
+      type: "TextBlock",
+      text: "高リスク・注意の該当案件はありません。",
+      wrap: true,
+      isSubtle: true,
+    });
+  } else {
+    for (const e of shown) {
+      const factors =
+        e.riskFactors.length > 0 ? e.riskFactors.join(" / ") : "—";
+      body.push({
+        type: "TextBlock",
+        text: `[${e.businessNumber}] ${e.name}`,
+        weight: "Bolder",
+        wrap: true,
+      });
+      body.push({
+        type: "TextBlock",
+        text: `レベル: ${e.riskLevel}　スコア: ${e.riskScore}`,
+        wrap: true,
+        spacing: "None",
+      });
+      body.push({
+        type: "TextBlock",
+        text: `要因: ${factors}`,
+        wrap: true,
+        isSubtle: true,
+        spacing: "Small",
+      });
+    }
+    if (omitted > 0) {
+      body.push({
+        type: "TextBlock",
+        text: `ほか ${omitted} 件は週次レポート画像を参照してください。`,
+        wrap: true,
+        isSubtle: true,
+      });
+    }
+  }
+
+  body.push({
+    type: "ActionSet",
+    actions: [
+      {
+        type: "Action.OpenUrl",
+        title: "レポート画像を開く",
+        url: imageUrl,
+      },
+    ],
+  });
+
+  const payload = {
+    type: "message",
+    attachments: [
+      {
+        contentType: "application/vnd.microsoft.card.adaptive",
+        contentUrl: null,
+        content: {
+          $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+          type: "AdaptiveCard",
+          version: "1.4",
+          body,
+        },
+      },
+    ],
+  };
+
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(
+      `Teams webhook（リスク該当）送信失敗: HTTP ${res.status} ${res.statusText}\n${text}`
+    );
+  }
+
+  console.log("Teams へリスク該当案件の通知を送信しました。");
+}
+
 // ──────────────────────────────────────────────
 // メイン処理
 // ──────────────────────────────────────────────
@@ -943,6 +1061,13 @@ async function main() {
     totalAmount:  totalAmountLabel,
     highRiskDept: highRiskDeptLabel,
     cautionDept:  cautionDeptLabel,
+  });
+
+  await sendTeamsRiskDigest({
+    webhookUrl: TEAMS_WEBHOOK_URL,
+    dateLabel,
+    imageUrl,
+    riskLogEntries,
   });
 
   console.log("完了しました。");
