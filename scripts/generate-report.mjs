@@ -25,7 +25,11 @@
  *   { projects: [ { id, number, name, status, contractAmount,
  *                   allocationSection1, allocationSection2, allocationSection3,
  *                   responsibleSections, responsibleDept, revisedEndDate, endDate,
+ *                   originalEndDate, completionTargetDate,
  *                   startDate, originalStartDate, outsourcingAmount, ... } ] }
+ *
+ * リスクの残り日数・全期間: 工期終了（Overall と同じ revisedEnd ?? originalEnd ?? end）を過ぎた案件で
+ *   completionTargetDate があれば、そこまでを延長したスケジュールとして扱う。
  *
  * PROGRESS_BASHBOARD の app_data スキーマ:
  *   app_data テーブル, key = 'projects', value は JSONB 配列。
@@ -240,12 +244,29 @@ function dayDiffFloor(a, b) {
 }
 
 /**
+ * 工期終了日（Overall の completionRangeStartYmd と同じ優先度）。
+ * この日を過ぎたあとは完納目標日までが延長区間。
+ *
+ * @param {Object} project
+ * @returns {string | null}
+ */
+function mainScheduleEndYmdRaw(project) {
+  const raw =
+    project.revisedEndDate ??
+    project.originalEndDate ??
+    project.endDate ??
+    null;
+  if (raw == null || raw === "") return null;
+  return String(raw);
+}
+
+/**
  * @param {Object} project
  * @param {Date} today
  */
 function buildScheduleInputsForRisk(project, today) {
   const startRaw = project.originalStartDate ?? project.startDate;
-  const endRaw = project.revisedEndDate ?? project.endDate ?? null;
+  const endRaw = mainScheduleEndYmdRaw(project);
 
   const start = parseProjectDate(
     startRaw == null || startRaw === "" ? null : String(startRaw)
@@ -263,7 +284,26 @@ function buildScheduleInputsForRisk(project, today) {
     totalDays = Math.max(1, elapsedDays + 1);
   }
 
-  const remainingDays = end ? dayDiffFloor(end, today) : 99999;
+  const ct = parseProjectDate(
+    project.completionTargetDate == null || project.completionTargetDate === ""
+      ? null
+      : String(project.completionTargetDate)
+  );
+
+  let remainingDays;
+  if (end) {
+    const remainingFromMain = dayDiffFloor(end, today);
+    if (remainingFromMain <= 0 && ct) {
+      remainingDays = dayDiffFloor(ct, today);
+      if (start) {
+        totalDays = Math.max(1, dayDiffFloor(ct, start));
+      }
+    } else {
+      remainingDays = remainingFromMain;
+    }
+  } else {
+    remainingDays = 99999;
+  }
 
   const contractAmount = Number(project.contractAmount ?? 0);
   const outsourceCost = Number(
