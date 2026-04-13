@@ -30,6 +30,7 @@
  *
  * リスクの残り日数・全期間: 工期終了（Overall と同じ revisedEnd ?? originalEnd ?? end）を過ぎた案件で
  *   completionTargetDate があれば、そこまでを延長したスケジュールとして扱う。
+ * 経過日数・全期間・残り日数の算出は土日を除く（月〜金のみ。祝日はカレンダー日として数える）。
  *
  * PROGRESS_BASHBOARD の app_data スキーマ:
  *   app_data テーブル, key = 'projects', value は JSONB 配列。
@@ -244,6 +245,41 @@ function dayDiffFloor(a, b) {
 }
 
 /**
+ * 半開区間 [a, b) に含まれる月〜金の日数（a, b は 0 時の Date）。
+ * @param {Date} a
+ * @param {Date} b
+ */
+function countWeekdaysHalfOpen(a, b) {
+  if (!a || !b) return 0;
+  const s = new Date(a);
+  s.setHours(0, 0, 0, 0);
+  const e = new Date(b);
+  e.setHours(0, 0, 0, 0);
+  if (e <= s) return 0;
+  let n = 0;
+  const d = new Date(s);
+  while (d < e) {
+    const w = d.getDay();
+    if (w !== 0 && w !== 6) n++;
+    d.setDate(d.getDate() + 1);
+  }
+  return n;
+}
+
+/**
+ * dayDiffFloor(end, start) と同じ符号だが、経過する日は月〜金のみ数える（土日除外）。
+ * @param {Date} end
+ * @param {Date} start
+ */
+function weekdayDiffFloor(end, start) {
+  if (!end || !start) return 0;
+  const cal = dayDiffFloor(end, start);
+  if (cal === 0) return 0;
+  if (cal > 0) return countWeekdaysHalfOpen(start, end);
+  return -countWeekdaysHalfOpen(end, start);
+}
+
+/**
  * 工期終了日（Overall の completionRangeStartYmd と同じ優先度）。
  * この日を過ぎたあとは完納目標日までが延長区間。
  *
@@ -263,6 +299,7 @@ function mainScheduleEndYmdRaw(project) {
 /**
  * @param {Object} project
  * @param {Date} today
+ * 延長判定（工期超過か）はカレンダー。経過・全期間・残りは月〜金のみ数える。
  */
 function buildScheduleInputsForRisk(project, today) {
   const startRaw = project.originalStartDate ?? project.startDate;
@@ -275,35 +312,30 @@ function buildScheduleInputsForRisk(project, today) {
     endRaw == null || endRaw === "" ? null : String(endRaw)
   );
 
-  const elapsedDays = start ? Math.max(0, dayDiffFloor(today, start)) : 0;
-
-  let totalDays = 1;
-  if (start && end) {
-    totalDays = Math.max(1, dayDiffFloor(end, start));
-  } else if (start && !end) {
-    totalDays = Math.max(1, elapsedDays + 1);
-  }
-
   const ct = parseProjectDate(
     project.completionTargetDate == null || project.completionTargetDate === ""
       ? null
       : String(project.completionTargetDate)
   );
 
-  let remainingDays;
-  if (end) {
-    const remainingFromMain = dayDiffFloor(end, today);
-    if (remainingFromMain <= 0 && ct) {
-      remainingDays = dayDiffFloor(ct, today);
-      if (start) {
-        totalDays = Math.max(1, dayDiffFloor(ct, start));
-      }
-    } else {
-      remainingDays = remainingFromMain;
-    }
-  } else {
-    remainingDays = 99999;
+  /** 延長に切り替える判定のみカレンダー日（Overall の運用と揃える） */
+  const pastMainScheduleCal =
+    end && dayDiffFloor(end, today) <= 0;
+  const effectiveEnd =
+    end && pastMainScheduleCal && ct ? ct : end;
+
+  const elapsedDays = start ? Math.max(0, weekdayDiffFloor(today, start)) : 0;
+
+  let totalDays = 1;
+  if (start && effectiveEnd) {
+    totalDays = Math.max(1, weekdayDiffFloor(effectiveEnd, start));
+  } else if (start && !end) {
+    totalDays = Math.max(1, elapsedDays + 1);
   }
+
+  const remainingDays = effectiveEnd
+    ? weekdayDiffFloor(effectiveEnd, today)
+    : 99999;
 
   const contractAmount = Number(project.contractAmount ?? 0);
   const outsourceCost = Number(
