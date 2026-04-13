@@ -11,14 +11,16 @@
  *   4. calculateRisk で案件ごとにリスク評価し、課別に highRiskCount / cautionCount を集計
  *   5. index.html テンプレートにデータを埋め込んで dist/report.html を生成
  *   6. Playwright でスクリーンショット → dist/report-YYYYMMDD-<ms>.png を保存し、あわせて report-latest.png にも同内容をコピー
- *   7. Teams Incoming Webhook に Adaptive Card を2 回送信（週次サマリー用・リスク該当案件用）
+ *   7. Teams Incoming Webhook に Adaptive Card を2 回送信（週次サマリー用・リスク該当案件用）。
+ *      サマリーは TEAMS_WEBHOOK_URL、詳細は TEAMS_RISK_WEBHOOK_URL（任意・未設定時はサマリーと同じ URL）。
  *
  * 必要な環境変数:
  *   OVERALL_PROJECT_SCHEDULE_URL - overall-project-schedule アプリの URL
  *                                  （例: https://your-app.example.com）
  *                                  /api/projects-data エンドポイントを使用する
  *   PROGRESS_BASHBOARD_URL       - PROGRESS_BASHBOARD の Neon 接続文字列
- *   TEAMS_WEBHOOK_URL            - Teams チャネルの Incoming Webhook URL
+ *   TEAMS_WEBHOOK_URL            - 週次サマリー用 Teams Incoming Webhook URL
+ *   TEAMS_RISK_WEBHOOK_URL       - リスク該当案件の詳細メッセージ用（任意。未設定時は TEAMS_WEBHOOK_URL）
  *   PAGES_BASE_URL               - GitHub Pages のベース URL（例: https://user.github.io/repo）
  *
  * overall-project-schedule API レスポンス（GET /api/projects-data）:
@@ -972,6 +974,10 @@ async function main() {
   const OVERALL_PROJECT_SCHEDULE_URL = process.env.OVERALL_PROJECT_SCHEDULE_URL;
   const PROGRESS_BASHBOARD_URL       = process.env.PROGRESS_BASHBOARD_URL;
   const TEAMS_WEBHOOK_URL            = process.env.TEAMS_WEBHOOK_URL;
+  const TEAMS_RISK_WEBHOOK_URL       =
+    (process.env.TEAMS_RISK_WEBHOOK_URL &&
+      String(process.env.TEAMS_RISK_WEBHOOK_URL).trim()) ||
+    process.env.TEAMS_WEBHOOK_URL;
   const PAGES_BASE_URL               = process.env.PAGES_BASE_URL ?? "";
 
   if (!OVERALL_PROJECT_SCHEDULE_URL)
@@ -1137,8 +1143,11 @@ async function main() {
     cautionDept:  cautionDeptLabel,
   });
 
+  if (TEAMS_RISK_WEBHOOK_URL !== TEAMS_WEBHOOK_URL) {
+    console.log("リスク該当案件は別チャネル用 Webhook に送信します。");
+  }
   await sendTeamsRiskDigest({
-    webhookUrl: TEAMS_WEBHOOK_URL,
+    webhookUrl: TEAMS_RISK_WEBHOOK_URL,
     dateLabel,
     imageUrl,
     riskLogEntries,

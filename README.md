@@ -78,16 +78,18 @@ GitHub リポジトリの **Settings → Secrets and variables → Actions** で
 
 #### Secrets（機密情報）
 
-| Secret 名           | 内容                                                              |
-|---------------------|-------------------------------------------------------------------|
-| `DATABASE_URL`      | Neon の接続文字列（`postgresql://...@...neon.tech/...`）           |
-| `TEAMS_WEBHOOK_URL` | Teams チャネルの Incoming Webhook URL                              |
+| Secret 名                 | 内容 |
+|---------------------------|-------------------------------------------------------------------|
+| `DATABASE_URL`            | Neon の接続文字列（`postgresql://...@...neon.tech/...`）           |
+| `TEAMS_WEBHOOK_URL`     | **週次サマリー**（画像付きカード）用の Incoming Webhook URL |
+| `TEAMS_RISK_WEBHOOK_URL` | **リスク該当案件の詳細**用の Incoming Webhook URL（別チャネル向け） |
+|                           | 未設定のときは `TEAMS_WEBHOOK_URL` と同じチャネルに連続投稿します。 |
 
 **Teams Incoming Webhook の取得手順:**
 1. Teams でチャネルを開く
 2. チャネル名の右クリック → **コネクタ**（または「チャネルの管理」→「コネクタ」）
 3. 「受信 Webhook」→ 構成 → 名前を入力 → 作成
-4. 生成された URL をコピーして `TEAMS_WEBHOOK_URL` に設定
+4. 生成された URL をコピーして `TEAMS_WEBHOOK_URL`（および必要なら `TEAMS_RISK_WEBHOOK_URL`）に設定
 
 #### Variables（非機密情報）
 
@@ -110,6 +112,7 @@ npm install
 # 環境変数を設定してスクリプトを実行
 DATABASE_URL="postgresql://..." \
 TEAMS_WEBHOOK_URL="https://..." \
+TEAMS_RISK_WEBHOOK_URL="https://..." \
 PAGES_BASE_URL="https://your-org.github.io/teams-weekly-summary" \
 npm run report
 ```
@@ -160,6 +163,6 @@ const SECTIONS = ["1課", "2課", "3課"];
 |-------------------------------|----------------------------------------------------------------|
 | DB 接続エラー                 | `DATABASE_URL` の接続文字列が正しいか確認                       |
 | データが 0 件                 | SQL のテーブル名・カラム名を実際のスキーマに合わせて調整         |
-| Teams に届かない              | `TEAMS_WEBHOOK_URL` が有効か、チャネルの Webhook 設定を確認     |
+| Teams に届かない              | `TEAMS_WEBHOOK_URL` / `TEAMS_RISK_WEBHOOK_URL` が有効か、各チャネルの Webhook を確認 |
 | 画像が Teams に表示されない   | `PAGES_BASE_URL` が正しいか、GitHub Pages が有効かを確認        |
 | Puppeteer でエラー            | Actions ログで Chromium 依存ライブラリのインストールを確認       |

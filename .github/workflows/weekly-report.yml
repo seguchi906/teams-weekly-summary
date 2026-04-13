@@ -58,7 +58,7 @@ jobs:
       #      - Neon DB から進捗率を取得しジョイン
       #      - HTML テンプレートにデータを埋め込む
       #      - Playwright でスクリーンショット撮影
-      #      - Teams Incoming Webhook に Adaptive Card 送信
+      #      - Teams Incoming Webhook に Adaptive Card 送信（サマリー・リスク詳細は別 URL 可）
       # ─────────────────────────────────────────
       - name: レポートを生成して Teams に送信
         run: node scripts/generate-report.mjs
@@ -66,6 +66,7 @@ jobs:
           OVERALL_PROJECT_SCHEDULE_URL: ${{ secrets.OVERALL_PROJECT_SCHEDULE }}
           PROGRESS_BASHBOARD_URL: ${{ secrets.PROGRESS_BASHBOARD }}
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          TEAMS_RISK_WEBHOOK_URL: ${{ secrets.TEAMS_RISK_WEBHOOK_URL }}
           PAGES_BASE_URL: https://seguchi906.github.io/teams-weekly-summary
 
       # ─────────────────────────────────────────
