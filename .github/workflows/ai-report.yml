@@ -14,19 +14,24 @@ jobs:
       - name: Nodeセットアップ
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: package-lock.json
 
       - name: 依存インストール
-        run: npm install
+        run: npm ci
 
       - name: Playwrightブラウザ導入
-        run: npx playwright install chromium
+        run: npx playwright install --with-deps chromium
 
-      - name: AI提案だけ生成
+      # generate-report.mjs: 週次サマリー → リスク詳細 →（設定時）AI 提案カードの順で Teams に送信
+      - name: レポート生成と Teams 送信
         run: node scripts/generate-report.mjs
         env:
           OVERALL_PROJECT_SCHEDULE_URL: ${{ secrets.OVERALL_PROJECT_SCHEDULE }}
           PROGRESS_BASHBOARD_URL: ${{ secrets.PROGRESS_BASHBOARD }}
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          TEAMS_RISK_WEBHOOK_URL: ${{ secrets.TEAMS_RISK_WEBHOOK_URL }}
+          TEAMS_AI_WEBHOOK_URL: ${{ secrets.TEAMS_AI_REPORT_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          SKIP_TEAMS_SEND: "1"
+          PAGES_BASE_URL: https://seguchi906.github.io/teams-weekly-summary
