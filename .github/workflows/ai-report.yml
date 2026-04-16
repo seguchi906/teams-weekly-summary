@@ -19,6 +19,9 @@ jobs:
       - name: 依存インストール
         run: npm install
 
+      - name: Playwrightブラウザ導入
+        run: npx playwright install chromium
+
       - name: AI提案だけ生成
         run: node scripts/generate-report.mjs
         env:
