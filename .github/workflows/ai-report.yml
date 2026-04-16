@@ -24,5 +24,6 @@ jobs:
         env:
           OVERALL_PROJECT_SCHEDULE_URL: ${{ secrets.OVERALL_PROJECT_SCHEDULE }}
           PROGRESS_BASHBOARD_URL: ${{ secrets.PROGRESS_BASHBOARD }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SKIP_TEAMS_SEND: "1"
