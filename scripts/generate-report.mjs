@@ -25,6 +25,7 @@
  *   PAGES_BASE_URL               - GitHub Pages のベース URL（例: https://user.github.io/repo）
  *   GEMINI_API_KEY               - 任意。Google AI（Gemini）で週次 AI 提案を生成。未設定時はルールベースのフォールバック
  *   GEMINI_MODEL                 - 任意。例: models/gemini-2.5-flash
+ *   SKIP_TEAMS_SEND              - 任意。1 / true / yes のとき Teams へ送信せず dist のみ生成（TEAMS_WEBHOOK_URL は不要）
  *
  * overall-project-schedule API レスポンス（GET /api/projects-data）:
  *   { projects: [ { id, number, name, status, contractAmount,
@@ -1087,6 +1088,9 @@ async function main() {
   const OVERALL_PROJECT_SCHEDULE_URL = process.env.OVERALL_PROJECT_SCHEDULE_URL;
   const PROGRESS_BASHBOARD_URL       = process.env.PROGRESS_BASHBOARD_URL;
   const TEAMS_WEBHOOK_URL            = process.env.TEAMS_WEBHOOK_URL;
+  const skipTeamsSend = ["1", "true", "yes"].includes(
+    String(process.env.SKIP_TEAMS_SEND ?? "").toLowerCase()
+  );
   const TEAMS_RISK_WEBHOOK_URL       =
     (process.env.TEAMS_RISK_WEBHOOK_URL &&
       String(process.env.TEAMS_RISK_WEBHOOK_URL).trim()) ||
@@ -1097,7 +1101,7 @@ async function main() {
     throw new Error("環境変数 OVERALL_PROJECT_SCHEDULE_URL が未設定です。");
   if (!PROGRESS_BASHBOARD_URL)
     throw new Error("環境変数 PROGRESS_BASHBOARD_URL が未設定です。");
-  if (!TEAMS_WEBHOOK_URL)
+  if (!TEAMS_WEBHOOK_URL && !skipTeamsSend)
     throw new Error("環境変数 TEAMS_WEBHOOK_URL が未設定です。");
   if (!PAGES_BASE_URL)
     console.warn("警告: PAGES_BASE_URL が未設定です。Teams の画像 URL が不正になります。");
@@ -1330,48 +1334,54 @@ async function main() {
   console.log("imageUrl（AI）:", imageUrlAi);
   console.log("dateLabel:", dateLabel);
 
-  console.log(
-    `Teams（週次サマリー）に通知を送信しています... (画像URL: ${imageUrl})`
-  );
-
-  await sendTeamsNotification({
-    webhookUrl: TEAMS_WEBHOOK_URL,
-    dateLabel,
-    imageUrl,
-    totalAmount: totalAmountLabel,
-    highRiskDept: highRiskDeptLabel,
-    cautionDept: cautionDeptLabel,
-  });
-
-  if (TEAMS_RISK_WEBHOOK_URL !== TEAMS_WEBHOOK_URL) {
-    console.log("リスク該当案件は別チャネル用 Webhook に送信します。");
-  }
-  await sendTeamsRiskDigest({
-    webhookUrl: TEAMS_RISK_WEBHOOK_URL,
-    dateLabel,
-    imageUrl,
-    riskLogEntries,
-  });
-
-  if (TEAMS_AI_WEBHOOK_URL) {
-    const sourceHint =
-      aiResult.source === "gemini"
-        ? `生成: Gemini${aiResult.model ? `（${aiResult.model}）` : ""}`
-        : "生成: ルールベース（フォールバック）";
-    console.log(
-      `Teams（AI 提案チャネル）に通知を送信しています... (画像URL: ${imageUrlAi})`
-    );
-    await sendTeamsAiProposalCard({
-      webhookUrl: TEAMS_AI_WEBHOOK_URL,
-      dateLabel,
-      imageUrl: imageUrlAi,
-      aiDigestLines,
-      sourceHint,
-    });
-  } else {
+  if (skipTeamsSend) {
     console.warn(
-      "TEAMS_AI_WEBHOOK_URL が未設定のため、AI 提案は Teams に送信しません（dist/report-ai.html と report-ai-*.png は生成済み）。"
+      "SKIP_TEAMS_SEND が有効のため、Teams への送信を省略します（HTML・PNG・JSON は dist に出力済み）。"
     );
+  } else {
+    console.log(
+      `Teams（週次サマリー）に通知を送信しています... (画像URL: ${imageUrl})`
+    );
+
+    await sendTeamsNotification({
+      webhookUrl: TEAMS_WEBHOOK_URL,
+      dateLabel,
+      imageUrl,
+      totalAmount: totalAmountLabel,
+      highRiskDept: highRiskDeptLabel,
+      cautionDept: cautionDeptLabel,
+    });
+
+    if (TEAMS_RISK_WEBHOOK_URL !== TEAMS_WEBHOOK_URL) {
+      console.log("リスク該当案件は別チャネル用 Webhook に送信します。");
+    }
+    await sendTeamsRiskDigest({
+      webhookUrl: TEAMS_RISK_WEBHOOK_URL,
+      dateLabel,
+      imageUrl,
+      riskLogEntries,
+    });
+
+    if (TEAMS_AI_WEBHOOK_URL) {
+      const sourceHint =
+        aiResult.source === "gemini"
+          ? `生成: Gemini${aiResult.model ? `（${aiResult.model}）` : ""}`
+          : "生成: ルールベース（フォールバック）";
+      console.log(
+        `Teams（AI 提案チャネル）に通知を送信しています... (画像URL: ${imageUrlAi})`
+      );
+      await sendTeamsAiProposalCard({
+        webhookUrl: TEAMS_AI_WEBHOOK_URL,
+        dateLabel,
+        imageUrl: imageUrlAi,
+        aiDigestLines,
+        sourceHint,
+      });
+    } else {
+      console.warn(
+        "TEAMS_AI_WEBHOOK_URL が未設定のため、AI 提案は Teams に送信しません（dist/report-ai.html と report-ai-*.png は生成済み）。"
+      );
+    }
   }
 
   console.log("完了しました。");
