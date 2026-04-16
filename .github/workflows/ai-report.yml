@@ -1,4 +1,4 @@
-name: AI提案テスト
+name: AIレポート
 
 on:
   workflow_dispatch:
@@ -27,6 +27,6 @@ jobs:
         env:
           OVERALL_PROJECT_SCHEDULE_URL: ${{ secrets.OVERALL_PROJECT_SCHEDULE }}
           PROGRESS_BASHBOARD_URL: ${{ secrets.PROGRESS_BASHBOARD }}
-          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          TEAMS_AI_REPORT_URL: ${{ secrets.TEAMS_AI_REPORT_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SKIP_TEAMS_SEND: "1"
