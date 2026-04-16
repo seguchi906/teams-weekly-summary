@@ -1,0 +1,28 @@
+name: AI提案テスト
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ai-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: リポジトリ取得
+        uses: actions/checkout@v4
+
+      - name: Nodeセットアップ
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 依存インストール
+        run: npm install
+
+      - name: AI提案だけ生成
+        run: node scripts/generate-report.mjs
+        env:
+          OVERALL_PROJECT_SCHEDULE_URL: ${{ secrets.OVERALL_PROJECT_SCHEDULE }}
+          PROGRESS_BASHBOARD_URL: ${{ secrets.PROGRESS_BASHBOARD }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SKIP_TEAMS_SEND: "1"
