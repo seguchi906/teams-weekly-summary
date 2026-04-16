@@ -9,10 +9,10 @@
  *   3. overall.number === progress.id（業務番号）でジョインし、
  *      今週生産 = allocation × (現在% - 前回%) / 100、先週分 = allocation × (前回% - その前%) / 100（増加・減少どちらも反映）を課ごとに集計
  *   4. calculateRisk で案件ごとにリスク評価し、課別に highRiskCount / cautionCount を集計
- *   5. index.html テンプレートにデータを埋め込んで dist/report.html を生成
- *   6. Playwright でスクリーンショット → dist/report-YYYYMMDD-<ms>.png を保存し、あわせて report-latest.png にも同内容をコピー
- *   7. Teams Incoming Webhook に Adaptive Card を2 回送信（週次サマリー用・リスク該当案件用）。
- *      サマリーは TEAMS_WEBHOOK_URL、詳細は TEAMS_RISK_WEBHOOK_URL（任意・未設定時はサマリーと同じ URL）。
+ *   5. index.html で dist/report.html（表のみ・従来どおり）、index-ai.html で dist/report-ai.html（AI 提案のみ）を生成
+ *   6. Playwright でスクリーンショット → report-*.png / report-latest.png（表）、report-ai-*.png / report-ai-latest.png（AI）
+ *   7. Teams: TEAMS_WEBHOOK_URL に週次サマリー、TEAMS_RISK_WEBHOOK_URL にリスク詳細（任意・未設定時はサマリーと同じ URL）
+ *   8. TEAMS_AI_WEBHOOK_URL があれば別チャネルに AI 提案カード（任意）
  *
  * 必要な環境変数:
  *   OVERALL_PROJECT_SCHEDULE_URL - overall-project-schedule アプリの URL
@@ -21,7 +21,10 @@
  *   PROGRESS_BASHBOARD_URL       - PROGRESS_BASHBOARD の Neon 接続文字列
  *   TEAMS_WEBHOOK_URL            - 週次サマリー用 Teams Incoming Webhook URL
  *   TEAMS_RISK_WEBHOOK_URL       - リスク該当案件の詳細メッセージ用（任意。未設定時は TEAMS_WEBHOOK_URL）
+ *   TEAMS_AI_WEBHOOK_URL         - 任意。AI 提案レポート専用チャネルの Incoming Webhook。未設定時は AI 用 HTML/PNG のみ生成し Teams には送らない
  *   PAGES_BASE_URL               - GitHub Pages のベース URL（例: https://user.github.io/repo）
+ *   GEMINI_API_KEY               - 任意。Google AI（Gemini）で週次 AI 提案を生成。未設定時はルールベースのフォールバック
+ *   GEMINI_MODEL                 - 任意。例: models/gemini-2.5-flash
  *
  * overall-project-schedule API レスポンス（GET /api/projects-data）:
  *   { projects: [ { id, number, name, status, contractAmount,
@@ -44,6 +47,11 @@ import { copyFile, mkdir, readFile, writeFile } from "fs/promises";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { chromium } from "playwright";
+import {
+  buildAiDigestLines,
+  generateWeeklyAISuggestions,
+  renderWeeklyAiSuggestionsHtml,
+} from "./weekly-ai-suggestions.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
@@ -64,6 +72,17 @@ function buildTimestampedReportPngFileName(d) {
   const mo = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `report-${y}${mo}${day}-${Date.now()}.png`;
+}
+
+/**
+ * @param {Date} d
+ * @returns {string} 例: report-ai-20260416-1713012345678.png
+ */
+function buildTimestampedAiPngFileName(d) {
+  const y = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `report-ai-${y}${mo}${day}-${Date.now()}.png`;
 }
 
 // ──────────────────────────────────────────────
@@ -725,15 +744,17 @@ function buildDeptRow(stat) {
  *
  * @param {string} htmlPath 読み込む HTML ファイルの絶対パス（file:// URL）
  * @param {string} outputPath 出力 PNG ファイルのパス
+ * @param {{ viewportHeight?: number }} [opts]
  */
-async function takeScreenshot(htmlPath, outputPath) {
+async function takeScreenshot(htmlPath, outputPath, opts = {}) {
+  const viewportHeight = opts.viewportHeight ?? 900;
   const browser = await chromium.launch({
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
 
   try {
     const page = await browser.newPage();
-    await page.setViewportSize({ width: 720, height: 900 });
+    await page.setViewportSize({ width: 720, height: viewportHeight });
     await page.goto(`file://${htmlPath}`, { waitUntil: "networkidle" });
 
     const card = page.locator(".max-w-2xl");
@@ -773,6 +794,32 @@ async function sendTeamsNotification(opts) {
     cautionDept,
   } = opts;
 
+  /** @type {object[]} */
+  const adaptiveBody = [
+    {
+      type: "TextBlock",
+      text: `週次レポート　${dateLabel}`,
+      weight: "Bolder",
+      size: "Medium",
+      wrap: true,
+    },
+    {
+      type: "FactSet",
+      facts: [
+        { title: "合計生産額", value: `${totalAmount} 万円` },
+        { title: "高リスク該当", value: highRiskDept || "なし" },
+        { title: "注意該当", value: cautionDept || "なし" },
+      ],
+    },
+  ];
+
+  adaptiveBody.push({
+    type: "Image",
+    url: imageUrl,
+    altText: `週次レポート ${dateLabel}`,
+    size: "Stretch",
+  });
+
   const payload = {
     type: "message",
     attachments: [
@@ -783,29 +830,7 @@ async function sendTeamsNotification(opts) {
           $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
           type: "AdaptiveCard",
           version: "1.4",
-          body: [
-            {
-              type: "TextBlock",
-              text: `週次レポート　${dateLabel}`,
-              weight: "Bolder",
-              size: "Medium",
-              wrap: true,
-            },
-            {
-              type: "FactSet",
-              facts: [
-                { title: "合計生産額", value: `${totalAmount} 万円` },
-                { title: "高リスク該当", value: highRiskDept || "なし" },
-                { title: "注意該当", value: cautionDept || "なし" },
-              ],
-            },
-            {
-              type: "Image",
-              url: imageUrl,
-              altText: `週次レポート ${dateLabel}`,
-              size: "Stretch",
-            },
-          ],
+          body: adaptiveBody,
           actions: [
             {
               type: "Action.OpenUrl",
@@ -832,6 +857,94 @@ async function sendTeamsNotification(opts) {
   }
 
   console.log("Teams への通知を送信しました。");
+}
+
+/**
+ * AI 提案専用チャネル向け Adaptive Card（別 HTML・別 PNG の URL）。
+ *
+ * @param {{
+ *   webhookUrl: string;
+ *   dateLabel: string;
+ *   imageUrl: string;
+ *   aiDigestLines: string[];
+ *   sourceHint: string;
+ * }} opts
+ */
+async function sendTeamsAiProposalCard(opts) {
+  const { webhookUrl, dateLabel, imageUrl, aiDigestLines, sourceHint } = opts;
+
+  /** @type {object[]} */
+  const body = [
+    {
+      type: "TextBlock",
+      text: `週次 AI 提案　${dateLabel}`,
+      weight: "Bolder",
+      size: "Medium",
+      wrap: true,
+    },
+    {
+      type: "TextBlock",
+      text: sourceHint,
+      wrap: true,
+      isSubtle: true,
+      size: "Small",
+    },
+  ];
+
+  if (Array.isArray(aiDigestLines) && aiDigestLines.length > 0) {
+    body.push({
+      type: "TextBlock",
+      text: `【要約】\n${aiDigestLines.join("\n")}`,
+      wrap: true,
+      spacing: "Small",
+      size: "Small",
+    });
+  }
+
+  body.push({
+    type: "Image",
+    url: imageUrl,
+    altText: `週次 AI 提案 ${dateLabel}`,
+    size: "Stretch",
+  });
+
+  const payload = {
+    type: "message",
+    attachments: [
+      {
+        contentType: "application/vnd.microsoft.card.adaptive",
+        contentUrl: null,
+        content: {
+          $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+          type: "AdaptiveCard",
+          version: "1.4",
+          body,
+          actions: [
+            {
+              type: "Action.OpenUrl",
+              title: "AI 提案画像を開く",
+              url: imageUrl,
+            },
+          ],
+        },
+      },
+    ],
+  };
+
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(
+      `Teams webhook（AI 提案）送信失敗: HTTP ${res.status} ${res.statusText}\n${text}`
+    );
+  }
+
+  console.log("Teams（AI 提案チャネル）への通知を送信しました。");
 }
 
 /**
@@ -1075,6 +1188,46 @@ async function main() {
   console.log(`  総生産金額: ${totalAmountLabel} 万円`);
   console.log("────────────────────────────────────────────\n");
 
+  const weeklySnapshot = {
+    dateLabel,
+    sections: SECTIONS.map((sec) => {
+      const d = sectionMap.get(sec) ?? {
+        production: 0,
+        highRiskCount: 0,
+        cautionCount: 0,
+        totalCount: 0,
+      };
+      const prod = d.production;
+      const last = lastWeekMap[sec] ?? 0;
+      const { label: weekOverWeekLabel } = weekOverWeekDisplay(prod, last);
+      return {
+        section: sec,
+        productionYen: prod,
+        productionManYen: toManYen(prod),
+        lastWeekYen: last,
+        weekOverWeekLabel,
+        highRiskCount: d.highRiskCount,
+        cautionCount: d.cautionCount,
+        totalCount: d.totalCount,
+      };
+    }),
+    totalProductionYen,
+    totalAmountManYen: totalAmountLabel,
+    highRiskDeptLabel,
+    cautionDeptLabel,
+    riskLogEntries,
+    matchedCount,
+    unmatchedOverallCount,
+    unmatchedProgressCount,
+  };
+
+  console.log("AI 提案を生成しています...");
+  const aiResult = await generateWeeklyAISuggestions(weeklySnapshot);
+  const aiSuggestionsHtmlPage = renderWeeklyAiSuggestionsHtml(aiResult, {
+    layout: "page",
+  });
+  const aiDigestLines = buildAiDigestLines(aiResult.suggestions);
+
   // ── 行 HTML 生成 ──
   const deptRows = SECTIONS.map((sec) => {
     const d = sectionMap.get(sec) ?? {
@@ -1099,48 +1252,95 @@ async function main() {
   let html = await readFile(templatePath, "utf-8");
 
   html = html
-    .replace("{{DATE}}",          dateLabel)
-    .replace("{{TOTAL_AMOUNT}}",  totalAmountLabel)
+    .replace("{{DATE}}", dateLabel)
+    .replace("{{TOTAL_AMOUNT}}", totalAmountLabel)
     .replace("{{HIGH_RISK_DEPT}}", highRiskDeptLabel)
-    .replace("{{CAUTION_DEPT}}",   cautionDeptLabel)
-    .replace("{{DEPT_ROWS}}",     deptRows);
+    .replace("{{CAUTION_DEPT}}", cautionDeptLabel)
+    .replace("{{DEPT_ROWS}}", deptRows);
+
+  const templateAiPath = join(ROOT, "index-ai.html");
+  let htmlAi = await readFile(templateAiPath, "utf-8");
+  htmlAi = htmlAi
+    .replace("{{DATE}}", dateLabel)
+    .replace("{{AI_SUGGESTIONS}}", aiSuggestionsHtmlPage);
 
   const distDir = join(ROOT, "dist");
   await mkdir(distDir, { recursive: true });
 
+  const aiJsonPath = join(distDir, "ai-suggestions.json");
+  await writeFile(
+    aiJsonPath,
+    JSON.stringify(
+      {
+        generatedAt: new Date().toISOString(),
+        source: aiResult.source,
+        model: aiResult.model ?? null,
+        note: aiResult.note,
+        suggestions: aiResult.suggestions,
+      },
+      null,
+      2
+    ),
+    "utf-8"
+  );
+  console.log(`AI 提案 JSON を保存しました: ${aiJsonPath}`);
+
   const reportHtmlPath = join(distDir, "report.html");
   await writeFile(reportHtmlPath, html, "utf-8");
-  console.log(`HTML を生成しました: ${reportHtmlPath}`);
+  console.log(`HTML（週次表）を生成しました: ${reportHtmlPath}`);
 
-  // ── スクリーンショット（一意ファイル名 + report-latest へミラー） ──
+  const reportAiHtmlPath = join(distDir, "report-ai.html");
+  await writeFile(reportAiHtmlPath, htmlAi, "utf-8");
+  console.log(`HTML（AI 提案）を生成しました: ${reportAiHtmlPath}`);
+
+  // ── スクリーンショット（週次表・AI 別ファイル） ──
   console.log("スクリーンショットを撮影しています...");
   const reportPngFileName = buildTimestampedReportPngFileName(now);
   const reportPngPath = join(distDir, reportPngFileName);
-  await takeScreenshot(reportHtmlPath, reportPngPath);
+  await takeScreenshot(reportHtmlPath, reportPngPath, { viewportHeight: 900 });
   const reportLatestPath = join(distDir, "report-latest.png");
   await copyFile(reportPngPath, reportLatestPath);
-  console.log(`スクリーンショットを保存しました: ${reportPngPath}`);
+  console.log(`スクリーンショット（週次表）: ${reportPngPath}`);
   console.log(`report-latest.png にコピーしました: ${reportLatestPath}`);
+
+  const reportAiPngFileName = buildTimestampedAiPngFileName(now);
+  const reportAiPngPath = join(distDir, reportAiPngFileName);
+  await takeScreenshot(reportAiHtmlPath, reportAiPngPath, {
+    viewportHeight: 1400,
+  });
+  const reportAiLatestPath = join(distDir, "report-ai-latest.png");
+  await copyFile(reportAiPngPath, reportAiLatestPath);
+  console.log(`スクリーンショット（AI 提案）: ${reportAiPngPath}`);
+  console.log(`report-ai-latest.png にコピーしました: ${reportAiLatestPath}`);
 
   // ── Teams 通知送信（キャッシュ回避: 一意パス + クエリ） ──
   const pagesBase = normalizePagesBaseUrl(PAGES_BASE_URL);
   const cacheBust = Date.now();
   const imageUrl = `${pagesBase}/${reportPngFileName}?v=${cacheBust}`;
+  const imageUrlAi = `${pagesBase}/${reportAiPngFileName}?v=${cacheBust}`;
+
+  const TEAMS_AI_WEBHOOK_URL =
+    (process.env.TEAMS_AI_WEBHOOK_URL &&
+      String(process.env.TEAMS_AI_WEBHOOK_URL).trim()) ||
+    "";
 
   console.log("reportHtmlPath:", reportHtmlPath);
-  console.log("reportPngPath:", reportPngPath);
-  console.log("imageUrl:", imageUrl);
+  console.log("reportAiHtmlPath:", reportAiHtmlPath);
+  console.log("imageUrl（週次表）:", imageUrl);
+  console.log("imageUrl（AI）:", imageUrlAi);
   console.log("dateLabel:", dateLabel);
 
-  console.log(`Teams に通知を送信しています... (画像URL: ${imageUrl})`);
+  console.log(
+    `Teams（週次サマリー）に通知を送信しています... (画像URL: ${imageUrl})`
+  );
 
   await sendTeamsNotification({
-    webhookUrl:   TEAMS_WEBHOOK_URL,
+    webhookUrl: TEAMS_WEBHOOK_URL,
     dateLabel,
     imageUrl,
-    totalAmount:  totalAmountLabel,
+    totalAmount: totalAmountLabel,
     highRiskDept: highRiskDeptLabel,
-    cautionDept:  cautionDeptLabel,
+    cautionDept: cautionDeptLabel,
   });
 
   if (TEAMS_RISK_WEBHOOK_URL !== TEAMS_WEBHOOK_URL) {
@@ -1152,6 +1352,27 @@ async function main() {
     imageUrl,
     riskLogEntries,
   });
+
+  if (TEAMS_AI_WEBHOOK_URL) {
+    const sourceHint =
+      aiResult.source === "gemini"
+        ? `生成: Gemini${aiResult.model ? `（${aiResult.model}）` : ""}`
+        : "生成: ルールベース（フォールバック）";
+    console.log(
+      `Teams（AI 提案チャネル）に通知を送信しています... (画像URL: ${imageUrlAi})`
+    );
+    await sendTeamsAiProposalCard({
+      webhookUrl: TEAMS_AI_WEBHOOK_URL,
+      dateLabel,
+      imageUrl: imageUrlAi,
+      aiDigestLines,
+      sourceHint,
+    });
+  } else {
+    console.warn(
+      "TEAMS_AI_WEBHOOK_URL が未設定のため、AI 提案は Teams に送信しません（dist/report-ai.html と report-ai-*.png は生成済み）。"
+    );
+  }
 
   console.log("完了しました。");
 }

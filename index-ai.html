@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>週次 AI 提案</title>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Noto Sans JP', 'sans-serif'],
+          },
+        },
+      },
+    }
+  </script>
+</head>
+<body class="min-h-screen bg-gradient-to-br from-slate-100 to-indigo-50 py-8 px-4 font-sans">
+
+  <div class="w-full max-w-2xl mx-auto">
+
+    <div class="bg-white rounded-2xl shadow-xl overflow-hidden">
+
+      <div class="bg-gradient-to-r from-indigo-700 to-slate-900 px-6 py-5 text-white">
+        <span class="inline-block text-xs font-medium bg-white/20 rounded-full px-2.5 py-0.5 mb-2 tracking-wide">
+          AI 提案レポート
+        </span>
+        <div class="flex items-baseline justify-between">
+          <h1 class="text-xl sm:text-2xl font-bold tracking-tight">週次 AI 提案</h1>
+          <p class="text-indigo-200 text-sm">{{DATE}}</p>
+        </div>
+      </div>
+
+      {{AI_SUGGESTIONS}}
+
+      <div class="px-5 py-3 bg-slate-50 border-t border-slate-100 text-xs text-slate-400">
+        <p>※ 提案は週次集計データに基づき Gemini またはルールベースで生成されています。</p>
+      </div>
+
+    </div>
+  </div>
+
+</body>
+</html>

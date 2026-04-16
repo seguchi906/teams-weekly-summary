@@ -67,6 +67,8 @@ jobs:
           PROGRESS_BASHBOARD_URL: ${{ secrets.PROGRESS_BASHBOARD }}
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
           TEAMS_RISK_WEBHOOK_URL: ${{ secrets.TEAMS_RISK_WEBHOOK_URL }}
+          TEAMS_AI_WEBHOOK_URL: ${{ secrets.TEAMS_AI_WEBHOOK_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PAGES_BASE_URL: https://seguchi906.github.io/teams-weekly-summary
 
       # ─────────────────────────────────────────
