@@ -6,7 +6,7 @@
  * 処理の流れ:
  *   1. overall-project-schedule の REST API からプロジェクト（受注金額・担当課）を取得
  *   2. PROGRESS_BASHBOARD Neon DB から weeklyProgress（末尾から最大3つの非 null 値）を取得
- *   3. overall.number === progress.id（業務番号）でジョインし、
+ *   3. overall.number === (progress.number ?? progress.id) でジョインし、
  *      今週生産 = allocation × (現在% - 前回%) / 100、先週分 = allocation × (前回% - その前%) / 100（増加・減少どちらも反映）を課ごとに集計
  *   4. calculateRisk で案件ごとにリスク評価し、課別に highRiskCount / cautionCount を集計
  *   5. index.html で dist/report.html（表のみ・従来どおり）、index-ai.html で dist/report-ai.html（AI 提案のみ）を生成
@@ -224,14 +224,15 @@ async function fetchProgressData(sql) {
 
   const map = new Map();
   for (const { project } of rows) {
-    if (project.id == null) continue;
+    const progressKey = project.number ?? project.id;
+    if (progressKey == null) continue;
     const { current, previous, beforePrevious } = lastThreeWeeklyProgressValues(
       project.weeklyProgress
     );
     const recordedProgress = getCurrentProgressFromWeekly(
       project.weeklyProgress
     );
-    map.set(String(project.id), {
+    map.set(String(progressKey), {
       current,
       previous,
       beforePrevious,
@@ -459,7 +460,7 @@ function calculateRisk({
 // ──────────────────────────────────────────────
 
 /**
- * overall.number === progress.id でジョインし、課ごとに生産金額を集計。
+ * overall.number === (progress.number ?? progress.id) でジョインし、課ごとに生産金額を集計。
  * 今週生産 = allocationSectionN × (現在% - 前回%) / 100（差分はマイナスもそのまま）
  * 現在進捗率が EXCLUDE_FROM_METRICS_PROGRESS_MIN 以上の案件は生産・リスク集計から除外。
  * 生産・リスク・件数の母集団は Overall Project Schedule の「進行中」と同じ:
@@ -1131,7 +1132,7 @@ async function main() {
   console.log(`  progress 案件数: ${progressDataMap.size} 件`);
 
   // ── JS 側でジョイン → 生産金額を集計 ──
-  // 結合キー: overall.number === progress.id（業務番号）
+  // 結合キー: overall.number === (progress.number ?? progress.id)
   const {
     sectionMap,
     matchedCount,
@@ -1150,7 +1151,7 @@ async function main() {
 
   if (matchedCount === 0) {
     console.warn(
-      "警告: 結合できた案件が 0 件でした。overall.number と progress.id の値を確認してください。"
+      "警告: 結合できた案件が 0 件でした。overall.number と progress.number / progress.id の値を確認してください。"
     );
   }
 
