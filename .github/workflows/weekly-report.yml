@@ -1,9 +1,9 @@
 name: 週次 Teams レポート送信
 
 on:
-  # 毎週金曜 12:05 JST (= UTC 金曜 03:05) に自動実行
+  # 毎週金曜 06:05 JST (= UTC 木曜 21:05) に自動実行
   schedule:
-    - cron: "5 3 * * 5"
+    - cron: "5 21 * * 4"
   # GitHub 画面から手動実行も可能
   workflow_dispatch:
 
